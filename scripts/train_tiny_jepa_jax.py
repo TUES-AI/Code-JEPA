@@ -53,6 +53,10 @@ class TrainConfig:
     weight_decay: float = 1e-4
     margin: float = 0.2
     rank_weight: float = 0.25
+    inbatch_weight: float = 0.1
+    inbatch_temperature: float = 0.1
+    variance_weight: float = 0.05
+    std_target: float = 0.05
     log_every: int = 20
     save_every: int = 250
 
@@ -156,7 +160,16 @@ def main() -> None:
 
     for step in range(1, cfg.steps + 1):
         batch = sample_batch(arrays, cfg.batch_size, rng)
-        state, metrics = train_step(state, batch, cfg.margin, cfg.rank_weight)
+        state, metrics = train_step(
+            state,
+            batch,
+            cfg.margin,
+            cfg.rank_weight,
+            cfg.inbatch_weight,
+            cfg.inbatch_temperature,
+            cfg.variance_weight,
+            cfg.std_target,
+        )
         if step == 1 or step % cfg.log_every == 0:
             record = {"event": "train", "step": step, "elapsed_s": round(time.time() - start, 2)}
             record.update({k: float(v) for k, v in metrics.items()})
@@ -187,6 +200,10 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--margin", type=float, default=0.2)
     parser.add_argument("--rank-weight", type=float, default=0.25)
+    parser.add_argument("--inbatch-weight", type=float, default=0.1)
+    parser.add_argument("--inbatch-temperature", type=float, default=0.1)
+    parser.add_argument("--variance-weight", type=float, default=0.05)
+    parser.add_argument("--std-target", type=float, default=0.05)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-every", type=int, default=250)
     return TrainConfig(**vars(parser.parse_args()))
@@ -288,7 +305,14 @@ def sample_batch(
 
 @jax.jit
 def train_step(
-    state: TrainState, batch: dict[str, jnp.ndarray], margin: float, rank_weight: float
+    state: TrainState,
+    batch: dict[str, jnp.ndarray],
+    margin: float,
+    rank_weight: float,
+    inbatch_weight: float,
+    inbatch_temperature: float,
+    variance_weight: float,
+    std_target: float,
 ) -> tuple[TrainState, dict[str, jnp.ndarray]]:
     def loss_fn(params):
         za, zp, zn, pred = state.apply_fn(
@@ -306,14 +330,33 @@ def train_step(
         sim_pos = jnp.sum(za * zp_sg, axis=-1)
         sim_neg = jnp.sum(za * zn_sg, axis=-1)
         rank_loss = jnp.mean(jnp.maximum(0.0, margin + sim_neg - sim_pos))
-        total = pred_loss + rank_weight * rank_loss
+
+        logits = (za @ zp_sg.T) / inbatch_temperature
+        labels = jnp.arange(logits.shape[0])
+        inbatch_loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+
+        embeds = jnp.concatenate([za, zp, zn], axis=0)
+        std = jnp.sqrt(jnp.var(embeds, axis=0) + 1e-6)
+        variance_loss = jnp.mean(jnp.square(jnp.maximum(0.0, std_target - std)))
+        mean_loss = jnp.mean(jnp.square(jnp.mean(embeds, axis=0)))
+
+        total = (
+            pred_loss
+            + rank_weight * rank_loss
+            + inbatch_weight * inbatch_loss
+            + variance_weight * (variance_loss + mean_loss)
+        )
         metrics = {
             "loss": total,
             "pred_loss": pred_loss,
             "rank_loss": rank_loss,
+            "inbatch_loss": inbatch_loss,
+            "variance_loss": variance_loss,
+            "mean_loss": mean_loss,
             "sim_pos": jnp.mean(sim_pos),
             "sim_neg": jnp.mean(sim_neg),
             "sim_gap": jnp.mean(sim_pos - sim_neg),
+            "std_mean": jnp.mean(std),
         }
         return total, metrics
 
