@@ -198,6 +198,27 @@ low strategy similarity                                            -> new soluti
 
 This rejects candidates that are only rephrasings of the same failed program. It does not certify that a novel candidate is correct. Novelty must be constrained by prompt fit, compile/static checks, type checks, or later verification.
 
+### 4. Semantic duplicate rejection during self-training
+
+When a generator samples many candidates for the same task, most may be rephrasings of the same algorithm or the same bug. Code-JEPA can cluster generated candidates before testing/judging:
+
+```text
+20 samples -> 4 semantic/strategy clusters -> keep representatives
+```
+
+Use cases:
+
+- reject candidates that are just surface rewrites of known bad attempts;
+- improve candidate-set diversity before expensive verification;
+- estimate unique solution-family coverage rather than raw sample count.
+
+Metrics:
+
+- unique failure/solution clusters per token budget;
+- pass@k per unique cluster;
+- same solve rate with fewer tests/rollouts;
+- duplicate-rejection precision: do not reject small real fixes as rephrases.
+
 ## Evaluation and baselines
 
 The first scientific bar is not DPO. It is proving that Code-JEPA is a better candidate judge/ranker than obvious baselines.

@@ -30,9 +30,9 @@ def positive_views(code: str, *, max_views: int = 3) -> list[TransformResult]:
         return []
 
     candidates = [
-        _ast_normalized(parsed.tree),
-        _remove_docstrings(parsed.tree),
-        _rename_locals(parsed.tree),
+        _safe_transform(_ast_normalized, parsed.tree),
+        _safe_transform(_remove_docstrings, parsed.tree),
+        _safe_transform(_rename_locals, parsed.tree),
     ]
     return _dedupe_valid(code, candidates, max_views=max_views)
 
@@ -43,13 +43,20 @@ def hard_negative_views(code: str, *, max_views: int = 6) -> list[TransformResul
         return []
 
     candidates = [
-        _flip_comparison(parsed.tree, code),
-        _flip_boolop(parsed.tree, code),
-        _swap_call_args(parsed.tree, code),
-        _wrong_variable(parsed.tree, code),
-        _flip_small_integer(parsed.tree, code),
+        _safe_transform(_flip_comparison, parsed.tree, code),
+        _safe_transform(_flip_boolop, parsed.tree, code),
+        _safe_transform(_swap_call_args, parsed.tree, code),
+        _safe_transform(_wrong_variable, parsed.tree, code),
+        _safe_transform(_flip_small_integer, parsed.tree, code),
     ]
     return _dedupe_valid(code, candidates, max_views=max_views)
+
+
+def _safe_transform(fn, *args) -> TransformResult | None:
+    try:
+        return fn(*args)
+    except (RecursionError, MemoryError):
+        return None
 
 
 def _dedupe_valid(
