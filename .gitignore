@@ -1,0 +1,25 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+.env.*
+*.egg-info/
+
+# local/large artifacts
+/data/
+/datasets/
+/outputs/
+/runs/
+/checkpoints/
+/artifacts/
+*.parquet
+*.arrow
+*.jsonl.zst
+
+# draft CI files requested but intentionally not committed yet
+CICD/

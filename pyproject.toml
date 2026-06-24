@@ -1,0 +1,19 @@
+[project]
+name = "code-jepa"
+version = "0.0.0"
+description = "Hard-negative-sensitive JEPA representations for code."
+requires-python = ">=3.10"
+dependencies = [
+  "datasets",
+  "pyarrow",
+  "pandas",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+transforms = ["black", "libcst", "tree-sitter"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "scripts", "tests"]
