@@ -23,6 +23,8 @@ def parse_and_compile(code: str) -> ParseResult:
             tree = ast.parse(code)
     except SyntaxError as exc:
         return ParseResult(None, False, False, f"SyntaxError: {exc}")
+    except (RecursionError, MemoryError) as exc:
+        return ParseResult(None, False, False, f"{type(exc).__name__}: {exc}")
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", SyntaxWarning)
