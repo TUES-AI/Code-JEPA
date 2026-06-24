@@ -18,7 +18,9 @@ class ParseResult:
 
 def parse_and_compile(code: str) -> ParseResult:
     try:
-        tree = ast.parse(code)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(code)
     except SyntaxError as exc:
         return ParseResult(None, False, False, f"SyntaxError: {exc}")
     try:
