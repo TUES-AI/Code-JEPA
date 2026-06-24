@@ -231,8 +231,9 @@ Start Python-first.
 Practical order:
 
 1. CodeSearchNet Python for function-level pipeline validation.
-2. Larger permissive whole-file Python corpus from The Stack / StarCoderData / similar once license filtering and storage are decided.
-3. Task/reference corpora for reranking and semantic positives: HumanEval, MBPP, APPS, CodeContests, CodeNet-like multi-solution datasets if accessible.
+2. CodeParrot clean Python as the public non-gated whole-file fallback when The Stack / StarCoderData auth is unavailable.
+3. Larger permissive whole-file Python corpus from The Stack / StarCoderData / similar once license filtering and storage are decided.
+4. Task/reference corpora for reranking and semantic positives: HumanEval, MBPP, APPS, CodeContests, CodeNet-like multi-solution datasets if accessible.
 
 Split by repository/source/task, never by transformed view. A unit and all derived views must remain in the same split.
 
