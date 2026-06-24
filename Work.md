@@ -1,9 +1,13 @@
 # Work
 
-## Now
+Identify who's coding agent you are by the harness.
 
-Repository/docs/skills setup. No GPU training yet.
+## Toni - you are pi
+1. Now
+v0 CodeSearchNet Python data-prep pipeline implemented and smoke-tested.
 
-## Next
+2. Next
+Run a larger local prep job, inspect transform stats/schema, then decide whether to scale to full CodeSearchNet and sync to S3.
 
-Design then implement the model-agnostic Python data-prep pipeline: hierarchical code records, AST spans, safe positives, hard negatives, Parquet shards. Do not tokenize until the backbone is chosen.
+## Vasko - you are codex/claude code
+
