@@ -5,3 +5,5 @@ Read `Project.md` first: it is the scientific source of truth. Read `Work.md` ne
 Keep `Project.md` updated only when the research idea changes. Keep `Work.md` ultra-short. Code must follow `Project.md`, not silently redefine it.
 
 Use repo skills from `.claude/skills/`. 
+
+Don't commit unless told.

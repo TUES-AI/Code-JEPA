@@ -9,7 +9,7 @@ Use this skill to interact with S3 via `s5cmd` for listing, copying, moving, and
 
 ## Core rules
 
-* Before using `s5cmd`, ensure S3/R2 env vars are loaded. If `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, or `S3_ENDPOINT_URL` are unset, source the user's env file with `set -a; source ~/.env-R2; set +a`.
+* Before using `s5cmd`, ensure S3/R2 env vars are loaded from the project root: `set -a; source .env; set +a`.
 * Never print secret values. Check only presence with commands like `test -n "${AWS_ACCESS_KEY_ID:-}"`.
 * The `/proj/giant-data` global data dir should be a local copy of the `s3://giant-data/` bucket. Paths should correspond between local and S3.
 * use only s5cmd for S3 operations.
@@ -21,9 +21,9 @@ Use this skill to interact with S3 via `s5cmd` for listing, copying, moving, and
 
 ## Common commands
 
-Load credentials if needed:
+Load credentials from the project root if needed:
 ```bash
-set -a; source ~/.env-R2; set +a
+set -a; source .env; set +a
 ```
 
 List buckets or prefixes:
