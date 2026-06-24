@@ -12,6 +12,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+models = ["torch", "transformers"]
 transforms = ["black", "libcst", "tree-sitter"]
 train = ["jax", "flax", "optax", "numpy"]
 
