@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,7 +22,9 @@ def parse_and_compile(code: str) -> ParseResult:
     except SyntaxError as exc:
         return ParseResult(None, False, False, f"SyntaxError: {exc}")
     try:
-        compile(tree, "<code_jepa_unit>", "exec")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            compile(tree, "<code_jepa_unit>", "exec")
     except Exception as exc:  # compile can fail on malformed transformed ASTs.
         return ParseResult(tree, True, False, f"{type(exc).__name__}: {exc}")
     return ParseResult(tree, True, True, None)
