@@ -11,13 +11,13 @@ Use this skill to interact with S3 via `s5cmd` for listing, copying, moving, and
 
 * Before using `s5cmd`, ensure S3/R2 env vars are loaded from the project root: `set -a; source .env; set +a`.
 * Never print secret values. Check only presence with commands like `test -n "${AWS_ACCESS_KEY_ID:-}"`.
-* The `/proj/giant-data` global data dir should be a local copy of the `s3://giant-data/` bucket. Paths should correspond between local and S3.
+* The project bucket is `"s3://code-jepa/"`; use it for Code-JEPA artifacts.
+* The local project data root should mirror the bucket under `/proj/code-jepa` or `/Volumes/SSD/datasets/code-jepa` depending on the machine.
 * use only s5cmd for S3 operations.
 * Always quote S3 URIs with double quotes.
-* `s5cmd mv` and `s5cmd cp` require wildcards when moving directories. Use `"s3://giant-data/path/*"`.
+* `s5cmd mv` and `s5cmd cp` require wildcards when moving directories. Use `"s3://code-jepa/path/*"`.
 * Avoid destructive deletes unless explicitly requested.
 * Avoid using `s5cmd sync` to or from the S3 bucket unless necessary. `cp` commands have less side effects. If you have to for whatever reason to use `sync`, use the `--size-only` flag because the user's S3 bucket is actually R2 which behaves badly with timestamps.
-* The deafult and only bucket is `"s3://giant-data/"`. 
 
 ## Common commands
 
@@ -28,22 +28,22 @@ set -a; source .env; set +a
 
 List buckets or prefixes:
 ```bash
-s5cmd ls "s3://giant-data/prefix/"
+s5cmd ls "s3://code-jepa/prefix/"
 ```
 
 Move a folder (use wildcard):
 ```bash
-s5cmd mv "s3://giant-data/src/*" "s3://bucket/dst/"
+s5cmd mv "s3://code-jepa/src/*" "s3://code-jepa/dst/"
 ```
 
 Copy a single file:
 ```bash
-s5cmd cp "s3://giant-data/path/file" "/local/path/"
+s5cmd cp "s3://code-jepa/path/file" "/local/path/"
 ```
 
 Sync a folder to local:
 ```bash
-s5cmd sync --size-only "s3://giant-data/prefix/" "/local/dir/"
+s5cmd sync --size-only "s3://code-jepa/prefix/" "/local/dir/"
 ```
 
 ## Notes

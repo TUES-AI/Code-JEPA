@@ -74,14 +74,14 @@ This matches the user's preferred fallback order.
 1. Make sure all the needed data is in the S3 bucket
 2. Create a sync_dirs.txt and entrypoint.sh which will be read on Pod startup, synced and executed. They live locally on the mac at:
 ```
-/proj/giant-data/sync_dirs.txt
-/proj/giant-data/entrypoint.sh
+/proj/code-jepa/sync_dirs.txt
+/proj/code-jepa/entrypoint.sh
 ```
 You will edit them and overwrite them for the current task. Preffer tmux for the entrypoint for the user to be easy to monitor.
 
 3. Sync them to the S3 
 ```bash
-s5cmd cp sync_dirs.txt "s3://giant-data/sync_dirs.txt" && s5cmd cp entrypoint.sh "s3://giant-data/entrypoint.sh"
+s5cmd cp sync_dirs.txt "s3://code-jepa/sync_dirs.txt" && s5cmd cp entrypoint.sh "s3://code-jepa/entrypoint.sh"
 ```
 
 Now whatever is in the S3 and stated in sync_dirs.txt will be on the pod on startup and whatever it was in entrypoint.sh will be ran so the gpu can start working right away if needed.
@@ -104,7 +104,7 @@ You should run commands to the remote gpu only like mentioned in your `gpu-remot
 When you stop or terminate the pod, push the generated artifacts to S3 first:
 
 ```bash
-s5cmd sync --size-only /proj/giant-data/Code-JEPA/checkpoints/ "s3://giant-data/Code-JEPA/checkpoints/"
+s5cmd sync --size-only /proj/code-jepa/checkpoints/ "s3://code-jepa/checkpoints/"
 ```
 
 Replace that path with the current job's checkpoint/output directory.
