@@ -4,10 +4,10 @@ Identify who's coding agent you are by the harness.
 
 ## Toni - you are pi
 1. Now
-GPU tiny-JEPA smoke completed on A40; 1B raw-token CodeParrot prep is running locally. PID/log: `52012`, `/Volumes/SSD/datasets/code-jepa/logs/codeparrot-python-1b-20260624-183130.log`.
+Two 1B-token CodeParrot chunks are complete locally and synced to `s3://code-jepa/processed/v0/runs/`; chunk3 stopped. Docker/CI setup for `bonanc/code-jepa` is prepared locally with DockerHub secrets set in GitHub.
 
 2. Next
-Every 30 min: check progress/disk; when finished, inspect stats/schema and sync successful artifacts to `s3://code-jepa/`.
+Commit the CICD/prep changes when reviewed, then build the training dataloader/tokenization path over `views` + `triples`.
 
 ## Vasko - you are codex/claude code
 

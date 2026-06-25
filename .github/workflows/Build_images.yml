@@ -1,0 +1,129 @@
+name: Build & push Code-JEPA training image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "CICD/Docker/code-jepa-training/**"
+      - ".dockerignore"
+      - ".github/workflows/Build_images.yml"
+      - "pyproject.toml"
+      - "README.md"
+      - "src/**"
+      - "scripts/**"
+      - "tests/**"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            image:
+              - "CICD/Docker/code-jepa-training/**"
+              - ".dockerignore"
+              - "pyproject.toml"
+              - "README.md"
+              - "src/**"
+              - "scripts/**"
+              - "tests/**"
+            workflow:
+              - ".github/workflows/Build_images.yml"
+
+      - name: Build dynamic matrix
+        id: set-matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_IMAGE="${{ steps.filter.outputs.image }}"
+          WF_CHANGED="${{ steps.filter.outputs.workflow }}"
+
+          if [ "$WF_CHANGED" = "true" ]; then
+            BUILD_IMAGE="true"
+          fi
+
+          include='[]'
+          if [ "$BUILD_IMAGE" = "true" ]; then
+            include=$(jq -c --arg sha "$GITHUB_SHA" '
+              . + [{
+                image_name: "code-jepa-training",
+                image_repo: "code-jepa",
+                context: ".",
+                dockerfile: "./CICD/Docker/code-jepa-training/Dockerfile",
+                tag: "latest"
+              }]' <<< "$include")
+          fi
+
+          matrix=$(jq -c --argjson inc "$include" '{include: $inc}' <<< '{}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Selected matrix: $matrix"
+
+  build-and-push:
+    needs: detect
+    if: ${{ fromJSON(needs.detect.outputs.matrix).include[0] != null }}
+    name: Build and push Docker image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
+
+    steps:
+      - name: Show disk usage before cleanup
+        run: df -h
+
+      - name: Free up disk space on GitHub runner
+        run: |
+          echo "=== Before cleanup ==="
+          df -h
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /home/linuxbrew/.linuxbrew || true
+          sudo apt-get clean
+          sudo docker system prune -af || true
+          sudo docker builder prune -af || true
+          echo "=== After cleanup ==="
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image (${{ matrix.image_name }})
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          pull: true
+          no-cache: false
+          platforms: linux/amd64
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.image_repo }}:${{ matrix.tag }}

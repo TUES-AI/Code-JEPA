@@ -1,0 +1,19 @@
+# Reference copy of the active workflow.
+# The GitHub Actions version that actually runs lives at:
+# .github/workflows/Build_images.yml
+
+name: Build & push Code-JEPA training image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "CICD/Docker/code-jepa-training/**"
+      - ".dockerignore"
+      - ".github/workflows/Build_images.yml"
+      - "pyproject.toml"
+      - "README.md"
+      - "src/**"
+      - "scripts/**"
+      - "tests/**"

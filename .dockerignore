@@ -1,3 +1,7 @@
+.git
+.env
+.env.*
+!.env.example
 .DS_Store
 __pycache__/
 *.py[cod]
@@ -6,12 +10,6 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
-.env
-.env.*
-!.env.example
-*.egg-info/
-
-# local/large artifacts
 /data/
 /datasets/
 /outputs/
@@ -21,4 +19,4 @@ venv/
 *.parquet
 *.arrow
 *.jsonl.zst
-
+CICD/tools/__pycache__/
