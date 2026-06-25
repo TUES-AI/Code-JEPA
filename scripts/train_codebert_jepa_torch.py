@@ -485,9 +485,22 @@ def autocast_dtype(precision: str) -> torch.dtype | None:
 def sync_s3(out: Path, prefix: str) -> None:
     if not prefix:
         return
-    cmd = ["s5cmd", "sync", "--size-only", f"{out}/*", prefix]
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for name in ["latest.pt", "metrics.jsonl", "run.log", "config.json"]:
+            path = out / name
+            if path.exists():
+                subprocess.run(
+                    ["s5cmd", "cp", str(path), f"{prefix.rstrip('/')}/{name}"],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        subprocess.run(
+            ["s5cmd", "sync", "--size-only", f"{out}/*", prefix],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     except Exception as exc:
         log(out, {"event": "s3_sync_failed", "error": f"{type(exc).__name__}: {exc}"})
 
