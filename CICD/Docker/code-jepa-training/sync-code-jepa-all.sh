@@ -10,4 +10,4 @@ if [[ -n "${S3_ENDPOINT_URL:-}" ]]; then
   export S3_ENDPOINT_URL
 fi
 
-s5cmd sync --size-only "s3://${S3_BUCKET}/" "${CODE_JEPA_DATA_ROOT}/"
+s5cmd sync --size-only "s3://${S3_BUCKET}/*" "${CODE_JEPA_DATA_ROOT}/"

@@ -17,7 +17,7 @@ sync-code-jepa-all
 Equivalent raw command:
 
 ```bash
-s5cmd sync --size-only "s3://code-jepa/" "/proj/code-jepa/"
+s5cmd sync --size-only "s3://code-jepa/*" "/proj/code-jepa/"
 ```
 
 Pods are still ephemeral: push checkpoints/artifacts back to `s3://code-jepa/` before deletion.

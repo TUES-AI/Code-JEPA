@@ -485,7 +485,7 @@ def autocast_dtype(precision: str) -> torch.dtype | None:
 def sync_s3(out: Path, prefix: str) -> None:
     if not prefix:
         return
-    cmd = ["s5cmd", "sync", "--size-only", f"{out}/", prefix]
+    cmd = ["s5cmd", "sync", "--size-only", f"{out}/*", prefix]
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as exc:
