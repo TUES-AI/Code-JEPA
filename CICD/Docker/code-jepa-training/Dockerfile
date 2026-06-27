@@ -8,7 +8,7 @@ ENV CGO_ENABLED=0 GOFLAGS="-buildvcs=false"
 RUN apk add --no-cache git
 RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go install -ldflags="-s -w" github.com/peak/s5cmd/v2@${S5CMD_VERSION}
 
-FROM --platform=linux/amd64 nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+FROM --platform=linux/amd64 nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
 
 ARG PYTHON_VERSION=3.11
 ARG DEBIAN_FRONTEND=noninteractive
@@ -18,6 +18,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     VENV_DIR=/opt/venv \
     APP_ROOT=/proj \
+    IMAGE_REPO_DIR=/opt/code-jepa-image \
     REPO_DIR=/proj/Code-JEPA \
     CODE_JEPA_DATA_ROOT=/proj/code-jepa \
     HF_HOME=/proj/huggingface \
@@ -85,19 +86,21 @@ RUN pip install -r /tmp/code-jepa-requirements.txt
 COPY --from=s5cmd-builder /go/bin/s5cmd /usr/local/bin/s5cmd
 COPY CICD/Docker/code-jepa-training/verify_gpu_stack.py /usr/local/bin/verify-gpu-stack
 COPY CICD/Docker/code-jepa-training/sync-code-jepa-all.sh /usr/local/bin/sync-code-jepa-all
-RUN chmod +x /usr/local/bin/verify-gpu-stack /usr/local/bin/sync-code-jepa-all \
+COPY CICD/Docker/code-jepa-training/entrypoint.sh /usr/local/bin/code-jepa-entrypoint
+RUN chmod +x /usr/local/bin/verify-gpu-stack /usr/local/bin/sync-code-jepa-all /usr/local/bin/code-jepa-entrypoint \
     && s5cmd version \
     && python /usr/local/bin/verify-gpu-stack
 
 RUN curl -fsSL https://tailscale.com/install.sh | sh
 
-WORKDIR $REPO_DIR
+WORKDIR $IMAGE_REPO_DIR
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY scripts ./scripts
 COPY tests ./tests
 RUN pip install -e ".[dev,transforms]"
 
-RUN mkdir -p "$CODE_JEPA_DATA_ROOT" "$HF_HOME" /proj/checkpoints /proj/artifacts
+RUN mkdir -p "$CODE_JEPA_DATA_ROOT" "$HF_HOME" /proj/checkpoints /proj/artifacts /var/lib/tailscale
 
-CMD ["bash"]
+ENTRYPOINT ["/usr/local/bin/code-jepa-entrypoint"]
+CMD []
