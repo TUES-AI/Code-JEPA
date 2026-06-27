@@ -1,5 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
+# Image-build workflow note:
+# This image is currently rebuilt by GitHub Actions and pushed to DockerHub as
+# bonanc/code-jepa:latest. Local code commits are not visible inside pods until
+# CI rebuilds the image or the working tree is patched into /proj/Code-JEPA.
+# A local CI/build path may be useful later for faster iteration, but CUDA images
+# need substantial SSD space, so GitHub's free hosted builders are the practical
+# default for now.
+
 FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS s5cmd-builder
 ARG TARGETOS
 ARG TARGETARCH

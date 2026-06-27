@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEFAULT_TEMPLATE_ID="bg2jwnb3zk"
-DEFAULT_TEMPLATE_NAME="GIANT-container"
+DEFAULT_TEMPLATE_ID="hzsxd14fdw"
+DEFAULT_TEMPLATE_NAME="Code-JEPA"
 DEFAULT_GPU_FALLBACK=(
   "NVIDIA RTX A6000"
   "NVIDIA RTX A5000"
@@ -26,7 +26,7 @@ Usage:
   runpod-gpu.sh remove POD_ID
 
 Defaults:
-  - template defaults to GIANT-container: bg2jwnb3zk
+  - template defaults to Code-JEPA: hzsxd14fdw
   - cloud type is always SECURE
   - `create --gpu auto` tries this order:
       NVIDIA RTX A6000 -> NVIDIA RTX A5000 -> NVIDIA RTX A4500 ->
@@ -34,7 +34,7 @@ Defaults:
 
 Examples:
   runpod-gpu.sh create --gpu auto --name code-jepa-job --wait
-  runpod-gpu.sh create --gpu "NVIDIA GeForce RTX 5090" --template-name GIANT-container --wait
+  runpod-gpu.sh create --gpu "NVIDIA GeForce RTX 5090" --template-name Code-JEPA --wait
   runpod-gpu.sh create --gpu "NVIDIA RTX A40" --spot --id-only
   runpod-gpu.sh list
   runpod-gpu.sh stop 123abc

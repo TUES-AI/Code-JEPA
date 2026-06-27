@@ -54,6 +54,7 @@ class TrainConfig:
     duration_minutes: float = 30.0
     seed: int = 0
     hidden_size: int = 512
+    projection_dim: int = 512
     layers: int = 6
     heads: int = 8
     intermediate_size: int = 2048
@@ -86,6 +87,63 @@ class TrainState(train_state.TrainState):
     pass
 
 
+class RMSNorm(nn.Module):
+    dtype: Any
+    epsilon: float = 1e-6
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        scale = self.param("scale", nn.initializers.ones, (x.shape[-1],), jnp.float32)
+        y = x.astype(jnp.float32)
+        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
+        return (y * scale).astype(self.dtype)
+
+
+class CudnnSelfAttention(nn.Module):
+    hidden_size: int
+    heads: int
+    dropout: float
+    dtype: Any
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, valid_tokens: jnp.ndarray, *, deterministic: bool) -> jnp.ndarray:
+        lengths = jnp.maximum(jnp.sum(valid_tokens, axis=1).astype(jnp.int32), 1)
+
+        def attention_fn(
+            query: jnp.ndarray,
+            key: jnp.ndarray,
+            value: jnp.ndarray,
+            *,
+            mask: jnp.ndarray | None = None,
+            dropout_rate: float = 0.0,
+            deterministic: bool = True,
+            dtype: Any = None,
+            precision: Any = None,
+        ) -> jnp.ndarray:
+            del mask, dropout_rate, deterministic, precision
+            y = jax.nn.dot_product_attention(
+                query,
+                key,
+                value,
+                query_seq_lengths=lengths,
+                key_value_seq_lengths=lengths,
+                implementation="cudnn",
+            )
+            return y.astype(dtype) if dtype is not None else y
+
+        y = nn.MultiHeadDotProductAttention(
+            num_heads=self.heads,
+            qkv_features=self.hidden_size,
+            out_features=self.hidden_size,
+            dropout_rate=0.0,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            attention_fn=attention_fn,
+            name="mha",
+        )(x, x, mask=None, deterministic=deterministic)
+        return nn.Dropout(rate=self.dropout)(y, deterministic=deterministic)
+
+
 class EncoderLayer(nn.Module):
     hidden_size: int
     heads: int
@@ -94,23 +152,42 @@ class EncoderLayer(nn.Module):
     dtype: Any
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, mask: jnp.ndarray, *, deterministic: bool) -> jnp.ndarray:
-        y = nn.LayerNorm(dtype=jnp.float32)(x).astype(self.dtype)
-        y = nn.SelfAttention(
-            num_heads=self.heads,
-            qkv_features=self.hidden_size,
-            out_features=self.hidden_size,
-            dropout_rate=self.dropout,
+    def __call__(self, x: jnp.ndarray, valid_tokens: jnp.ndarray, *, deterministic: bool) -> jnp.ndarray:
+        y = RMSNorm(dtype=self.dtype, name="attn_norm")(x)
+        y = CudnnSelfAttention(
+            hidden_size=self.hidden_size,
+            heads=self.heads,
+            dropout=self.dropout,
             dtype=self.dtype,
-            param_dtype=jnp.float32,
-        )(y, mask=mask, deterministic=deterministic)
+            name="attn",
+        )(y, valid_tokens, deterministic=deterministic)
         x = x + y.astype(x.dtype)
-        y = nn.LayerNorm(dtype=jnp.float32)(x).astype(self.dtype)
+        y = RMSNorm(dtype=self.dtype, name="ffn_norm")(x)
         y = nn.Dense(self.intermediate_size, dtype=self.dtype, param_dtype=jnp.float32)(y)
         y = nn.gelu(y)
         y = nn.Dropout(rate=self.dropout)(y, deterministic=deterministic)
         y = nn.Dense(self.hidden_size, dtype=self.dtype, param_dtype=jnp.float32)(y)
         return x + y.astype(x.dtype)
+
+
+class ProjectionHead(nn.Module):
+    hidden_size: int
+    projection_dim: int
+    dtype: Any
+
+    @nn.compact
+    def __call__(self, h: jnp.ndarray) -> jnp.ndarray:
+        gate_value = nn.Dense(
+            self.hidden_size * 8,
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            name="gate_value",
+        )(h)
+        gate, value = jnp.split(gate_value, 2, axis=-1)
+        z = jax.nn.swish(gate) * value
+        z = RMSNorm(dtype=self.dtype, name="norm")(z)
+        z = nn.Dense(self.projection_dim, dtype=self.dtype, param_dtype=jnp.float32, name="project")(z)
+        return z.astype(jnp.float32)
 
 
 class SiameseEncoder(nn.Module):
@@ -134,7 +211,6 @@ class SiameseEncoder(nn.Module):
             jnp.float32,
         )
         x = token_embed + pos_embed[None, :, :].astype(dtype)
-        attn_mask = mask_1d[:, None, None, :]
         for _ in range(self.cfg.layers):
             x = EncoderLayer(
                 hidden_size=self.cfg.hidden_size,
@@ -142,11 +218,16 @@ class SiameseEncoder(nn.Module):
                 intermediate_size=self.cfg.intermediate_size,
                 dropout=self.cfg.dropout,
                 dtype=dtype,
-            )(x, attn_mask, deterministic=deterministic)
-        x = nn.LayerNorm(dtype=jnp.float32)(x).astype(jnp.float32)
+            )(x, mask_1d, deterministic=deterministic)
+        x = RMSNorm(dtype=jnp.float32, name="final_norm")(x)
         weights = mask_1d.astype(jnp.float32)[..., None]
-        pooled = jnp.sum(x * weights, axis=1) / jnp.maximum(jnp.sum(weights, axis=1), 1.0)
-        return pooled
+        h = jnp.sum(x * weights, axis=1) / jnp.maximum(jnp.sum(weights, axis=1), 1.0)
+        return ProjectionHead(
+            hidden_size=self.cfg.hidden_size,
+            projection_dim=self.cfg.projection_dim,
+            dtype=dtype,
+            name="projection_head",
+        )(h)
 
 
 class SiameseModel(nn.Module):
@@ -251,6 +332,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--duration-minutes", type=float, default=30.0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--hidden-size", type=int, default=512)
+    p.add_argument("--projection-dim", type=int, default=512)
     p.add_argument("--layers", type=int, default=6)
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--intermediate-size", type=int, default=2048)
@@ -329,6 +411,7 @@ def main() -> None:
             cfg.sigreg_weight,
             cfg.sigreg_slices,
         )
+        jax.block_until_ready(metrics["loss"])
         elapsed = time.time() - started
         batch_s = time.time() - batch_started
         if step == 1 or step % cfg.log_every == 0:
@@ -363,11 +446,12 @@ def main() -> None:
 def create_state(model: SiameseModel, cfg: TrainConfig) -> TrainState:
     dummy = jnp.zeros((cfg.batch_size, 3, cfg.max_len), dtype=jnp.int32)
     variables = model.init(jax.random.PRNGKey(cfg.seed), dummy, deterministic=True)
+    decay_steps = max(cfg.steps, cfg.warmup_steps + 1)
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=cfg.lr,
         warmup_steps=cfg.warmup_steps,
-        decay_steps=cfg.steps,
+        decay_steps=decay_steps,
         end_value=cfg.lr * cfg.end_lr_ratio,
     )
     tx = optax.chain(

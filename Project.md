@@ -37,12 +37,24 @@ The model is not a correctness oracle. It ranks, clusters, detects duplicate fai
 Use a LeJEPA-style shared-encoder setup with a predictor:
 
 ```text
-anchor view va          -> E -> h_anchor -> predictor -> predicted positive embedding
-positive/negative views -> E -> z_pos / z_neg
-SIGReg(E outputs)
+code view -> shared transformer encoder -> hidden states H
+          -> mask-aware mean pool        -> h
+          -> projection head p(h)        -> z
+
+anchor z_anchor -> predictor -> predicted positive z
+positive/negative views -> z_pos / z_neg
+SIGReg(z outputs)
 ```
 
-LeJEPA training uses one shared encoder for all views: no target encoder, no EMA, and no stop-grad. Apply SIGReg after the encoder outputs. Use a small SIGReg coefficient around `0.03`-`0.05`; after reading LeJEPA, `0.10` should be treated as high/likely too much, not a normal setting.
+LeJEPA training uses one shared encoder for all views: no target encoder, no EMA, and no stop-grad. Apply SIGReg in the projected training space `z`, not directly to the reusable encoder embedding `h`. Use a small SIGReg coefficient around `0.03`-`0.05`; after reading LeJEPA, `0.10` should be treated as high/likely too much, not a normal setting.
+
+The default global projection head should be:
+
+```text
+p(h) = Dense(8H) -> split 4H/4H -> SwiGLU -> RMSNorm -> Dense(D)
+```
+
+Keep `h = pool(H)` as the frozen downstream/search embedding candidate, and train JEPA/ranking/SIGReg losses on `z = p(h)`. This gives SIGReg a loss space to shape without forcing the encoder output itself to become exactly Gaussian. The current no-head pooled-output path is only a baseline and throughput path. See [`docs/design-notes/embedding-pooling-and-projection-head.md`](docs/design-notes/embedding-pooling-and-projection-head.md).
 
 On top of the shared code encoder, use small projection/readout heads, not separate full transformers:
 
@@ -128,6 +140,12 @@ Hard negatives are compile-valid behavior-impacting mutations relative to the or
 - missing edge-case branch or wrong exception handling.
 
 Always record changed byte/AST spans. The local head depends on this metadata.
+
+### Dataset transform versions
+
+- `v0`: first conservative synthetic set. Positives: AST normalization, docstring removal, local variable/argument renaming. Negatives: comparison flip, boolean-op flip, call-argument swap, wrong variable, small integer flip.
+- `v1`: harder-negative augmentation over prepared units. Positives are regenerated as in `v0`; negatives add membership/identity flip, condition negation, arithmetic-op flip, subscript-index flip, default-value flip, sort reverse flip, return-value removal, and await removal.
+- `v2`: not defined yet. Reserve this name for the next materially different transform family, not for more shards of `v0`/`v1`.
 
 ## Per-head training labels
 
@@ -216,6 +234,40 @@ Metrics:
 - same solve rate with fewer tests/rollouts;
 - duplicate-rejection precision: do not reject small real fixes as rephrases.
 
+### 5. Out-of-the-box embedding tasks
+
+Code search and clone detection should be treated as cheap downstream checks that come almost for free from the Siamese embedding setup:
+
+```text
+code search:     query/code -> embeddings -> nearest neighbors
+clone detection: code/code  -> embeddings -> threshold or retrieval ranking
+```
+
+These tasks are not the core claim, but they are useful sanity checks and baseline comparisons because they require no agent loop, no verifier, and no decoder.
+
+### 6. Cross-language retrieval and code translation
+
+Use cross-language code-to-code retrieval as a bridge to code translation. A simple future task is Python-to-Java translation in latent space:
+
+```text
+Python context code -> Python context encoder -> z_py
+Java target code    -> Java target encoder    -> z_java
+z_py -> predictor -> predicted z_java
+```
+
+The predictor learns the Python-to-Java semantic mapping. This is a downstream/ablation setup, not a replacement for the default shared-encoder Code-JEPA training. Compare it against the simpler Siamese shared-encoder retrieval setup where Python and Java snippets are embedded directly and matched by cosine similarity.
+
+Evaluation should start with CodeNet-style same-problem Python/Java pairs and measure retrieval MAP/MRR before adding any decoder. If generation is added later, condition a Java generator on retrieved neighbors or the predicted Java-space embedding and compare against standard translation models.
+
+Ablations/baselines:
+
+- shared Siamese Code-JEPA retrieval vs Python-context/Java-target predictor mapping;
+- frozen vs finetuned encoders;
+- `h` embedding vs projected `z` space;
+- lexical and AST baselines;
+- CodeBERT / GraphCodeBERT / UniXcoder / CodeT5-style embeddings;
+- supervised seq2seq code translation where available.
+
 ## Evaluation and baselines
 
 The first scientific bar is not DPO. It is proving that Code-JEPA is a better candidate judge/ranker than obvious baselines.
@@ -273,5 +325,6 @@ Paper summaries live in `docs/paper_summaries/`:
 - LeJEPA: `docs/paper_summaries/summary_2511.08544_lejepa/summary.md`
 - LeWorldModel: `docs/paper_summaries/summary_2603.19312_leworldmodel/summary.md`
 - LLM-JEPA: `docs/paper_summaries/summary_2509.14252_llm_jepa/summary.md`
+- UniXcoder: `docs/paper_summaries/summary_2203.03850_unixcoder/summary.md`
 
 The duplication/literature-risk note is in `docs/literature/exa-duplication-review.md`.

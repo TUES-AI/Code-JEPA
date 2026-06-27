@@ -3,7 +3,7 @@
 
 The optimized path is:
 1. scripts/tokenize_jepa_triples.py
-2. scripts/train_siamese_bpe_jepa_jax.py
+2. scripts/train_siamese_bpe_jepa.py
 
 This wrapper is kept so old commands fail less surprisingly.
 """

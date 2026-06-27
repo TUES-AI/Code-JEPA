@@ -1,6 +1,6 @@
 ---
 name: deploy-gpu 
-description: Create/start/stop/delete a RunPod GPU Pod using the existing template named `GIANT-container`. Includes Spot (Secure Cloud) via interruptible Pods.
+description: Create/start/stop/delete a RunPod GPU Pod using the existing template named `Code-JEPA`. Includes Spot (Secure Cloud) via interruptible Pods.
 ---
 
 # RunPod Code-JEPA Pod
@@ -11,7 +11,7 @@ Use the helper script instead of raw `runpodctl`/`curl` commands:
 .claude/skills/deploy-gpu/scripts/runpod-gpu.sh create --gpu auto --name my-job --wait
 ```
 
-The script always uses the `GIANT-container` template id `bg2jwnb3zk`, keeps
+The script always uses the `Code-JEPA` template id `hzsxd14fdw`, keeps
 everything on Secure Cloud, handles the noisy CLI/REST fallback internally, and
 prints a concise summary instead of raw RunPod payloads.
 
@@ -20,7 +20,7 @@ prints a concise summary instead of raw RunPod payloads.
 ## Core rules
 
 * Secure Cloud only.
-* Use only the existing template `bg2jwnb3zk`.
+* Use only the existing template `hzsxd14fdw` (`Code-JEPA`).
 * Prefer the helper script over manual commands.
 * Use exact GPU if the user asks for one, otherwise use `--gpu auto`.
 * `--spot` means interruptible Secure Cloud via REST.
@@ -91,13 +91,28 @@ This workflow is for training jobs, for quick tests it is not needed to have a e
 
 # What to do when the Pod starts
 
-After the pod is created and startup sync finishes, find its Tailscale host with:
+After the pod is created, check for its Tailscale host:
 
 ```bash
 tailscale status | rg gpu
 ```
 
-You should run commands to the remote gpu only like mentioned in your `gpu-remote-exec` skill.
+Do **not** wait blindly on Tailscale. If the host is not visible after 3-5 minutes, treat it as a startup failure and inspect the pod logs in the RunPod UI before waiting longer. The local `runpodctl` version does not expose container logs.
+
+Bad startup signs to look for in logs:
+
+```text
+s3://giant-data/
+/proj/giant-data
+Code-JEPA/repo/code-jepa-*.tar.gz
+sync_dirs.txt from s3://giant-data/sync_dirs.txt
+NoSuchKey / 404 for giant-data objects
+entrypoint never reaches Tailscale startup / no [code-jepa] ready line
+```
+
+If any of those appear, the pod is using the wrong old startup/template path. Remove it immediately and fix the template/startup config before creating another pod; do not leave it retrying. The Code-JEPA path must use `s3://code-jepa/`, `/proj/code-jepa`, and the Code-JEPA image entrypoint.
+
+You should run commands on the remote GPU only as described in the `gpu-remote-exec` skill.
 
 # What to do when the Pod stops / you are terminating it
 

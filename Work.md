@@ -4,10 +4,10 @@ Identify who's coding agent you are by the harness.
 
 ## Toni - you are pi
 1. Now
-Completed: v0 finish pass `codeparrot-python-finish-after-3044410-10w-20260626-192449` produced 1.446B rough tokens, 1.934M kept files, 16.1M units, 102.2M views, 115.3M triples. Completed 6h Siamese continuation `siamese-bpe-sigreg-v0-cont6h-fullresume-20260626-203847`: final eval step 27500 rank_acc 0.9217; artifacts are on S3 and pulled locally. Added tokenized-cache/JAX throughput path; smoke cache `bpe16k-v0-smoke-20260627-123910` has 4096 examples at `s3://code-jepa/tokenized/bpe16k-v0-smoke-20260627-123910/`.
+Moved the performant Siamese BPE Code-JEPA implementation into `src/code_jepa/training/siamese_bpe_jepa.py`; `scripts/train_siamese_bpe_jepa.py` is now only a CLI wrapper. The path uses projected `z` with `Dense(8H) -> SwiGLU -> RMSNorm -> Dense(D)` and requests cuDNN dot-product attention through `MultiHeadDotProductAttention(attention_fn=...)`.
 
 2. Next
-Next: bring up one GPU only for throughput testing of `scripts/train_siamese_bpe_jepa_jax.py` against the tokenized smoke cache; do not start real training yet.
+Run a short GPU smoke for the RMSNorm + cuDNN attention + projection-head path, then compare throughput and early rank behavior against `jax-tokenized-b224-blocking-20260627-141926`.
 
 ## Vasko - you are codex/claude code
 
