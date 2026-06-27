@@ -151,7 +151,7 @@ class CodeLeJepaEmbeddings:
 
 @dataclass
 class CodeLeJepaPairOutput:
-    """Mock JEPA losses for context and target code views."""
+    """Mock LeJEPA losses for two code views."""
 
     loss: torch.Tensor
     semantic_jepa_loss: torch.Tensor
@@ -239,22 +239,22 @@ class RobertaCodeLeJepa(nn.Module):
         target = self(target_input_ids, target_attention_mask)
 
         semantic_prediction = self.semantic_predictor(context.semantic)
-        semantic_loss = F.mse_loss(semantic_prediction, target.semantic.detach())
+        semantic_loss = F.mse_loss(semantic_prediction, target.semantic)
 
         local_prediction = self.local_predictor(context.local)
         seq_len = min(local_prediction.size(1), target.local.size(1))
         local_mask = context.attention_mask[:, :seq_len] * target.attention_mask[:, :seq_len]
         local_loss = masked_mse(
             local_prediction[:, :seq_len],
-            target.local[:, :seq_len].detach(),
+            target.local[:, :seq_len],
             local_mask,
         )
 
-        semantic_samples = torch.cat([context.semantic, target.semantic], dim=0)
+        semantic_samples = torch.cat([context.pooled, target.pooled], dim=0)
         local_samples = torch.cat(
             [
-                flatten_masked_tokens(context.local, context.attention_mask),
-                flatten_masked_tokens(target.local, target.attention_mask),
+                flatten_masked_tokens(context.last_hidden_state, context.attention_mask),
+                flatten_masked_tokens(target.last_hidden_state, target.attention_mask),
             ],
             dim=0,
         )

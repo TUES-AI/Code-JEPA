@@ -44,7 +44,7 @@
 \node[box, fill=graybox, text width=2.6cm] (code) {\textbf{code sample} $y$\\function / patch / agent attempt};
 \node[box, fill=greenbox, text width=4.1cm, right=0.45cm of code] (pos) {\textbf{positive views} $y^+$: same behavior\\rename vars, format/comments, import reorder, syntax-equivalent rewrites, conservative refactor, AST/DFG/CFG/call-graph views};
 \node[box, fill=redbox, text width=4.15cm, below=0.18cm of pos] (neg) {\textbf{hard negatives} $y^-$: tiny behavior edits\\$<\leftrightarrow\le$, $+1\leftrightarrow -1$, \texttt{and}$\leftrightarrow$\texttt{or}, wrong variable, swapped args, loop bound, wrong API order, missing return/await};
-\node[box, fill=bluebox, text width=4.0cm, right=0.55cm of pos, yshift=-0.55cm] (jepa) {\textbf{JEPA pretraining}\\$v_c \to E_{ctx}\to h_c\to P_\theta(h_c)=\hat z_t$\\$v_t \to E_{tgt}^{EMA}\to z_t$};
+\node[box, fill=bluebox, text width=4.0cm, right=0.55cm of pos, yshift=-0.55cm] (jepa) {\textbf{LeJEPA pretraining}\\$v_a \to E\to h_a\to P_\theta(h_a)=\hat z^+$\\$v^+,v^- \to E\to z^+,z^-$\\SIGReg on $E$ outputs};
 \node[box, fill=yellowbox, text width=4.15cm, right=0.55cm of jepa] (heads) {\textbf{shared encoder + projection heads}\\$z_s=g_s(\mathrm{pool}(H))$ strategy\\$z_m=g_m(\mathrm{pool}(H))$ semantic\\$z_\ell=g_\ell(H)$ local/token/AST};
 \node[box, fill=graybox, text width=3.9cm, right=0.55cm of heads] (use) {\textbf{agent use}\\rank candidates, form preferences, reject duplicate failures, encourage new solution families};
 \draw[arrow] (code) -- (pos);

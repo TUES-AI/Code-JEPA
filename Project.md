@@ -34,18 +34,15 @@ The model is not a correctness oracle. It ranks, clusters, detects duplicate fai
 
 ## Model shape
 
-Use a normal JEPA setup with context/target encoders and a predictor:
+Use a LeJEPA-style shared-encoder setup with a predictor:
 
 ```text
-context view vc -> E_ctx -> h_ctx -> predictor -> predicted target embedding
- target view vt -> E_tgt -> z_tgt
+anchor view va          -> E -> h_anchor -> predictor -> predicted positive embedding
+positive/negative views -> E -> z_pos / z_neg
+SIGReg(E outputs)
 ```
 
-The exact anti-collapse mechanism is open. Candidate choices:
-
-- classic target encoder with stop-grad / EMA;
-- LeJEPA-style SIGReg to push embeddings toward an isotropic Gaussian;
-- hybrid if empirically needed.
+LeJEPA training uses one shared encoder for all views: no target encoder, no EMA, and no stop-grad. Apply SIGReg after the encoder outputs. Use a small SIGReg coefficient around `0.03`-`0.05`; after reading LeJEPA, `0.10` should be treated as high/likely too much, not a normal setting.
 
 On top of the shared code encoder, use small projection/readout heads, not separate full transformers:
 
@@ -146,7 +143,7 @@ Always record changed byte/AST spans. The local head depends on this metadata.
 Possible loss structure:
 
 ```text
-L = L_JEPA + lambda_pos L_pos + lambda_neg L_rank + lambda_local L_local + optional SIGReg
+L = L_JEPA + lambda_pos L_pos + lambda_neg L_rank + lambda_local L_local + lambda_sigreg L_SIGReg
 ```
 
 Ranking example:
@@ -244,6 +241,8 @@ Useful evaluation axes:
 - whether small meaningful fixes are kept instead of rejected as rephrases.
 
 Expected gains may be modest in pass@1. The stronger story is representation quality: semantic reranking, hard-negative sensitivity, and agent failure-memory usefulness.
+
+Current empirical note: on v0 synthetic triples, base CodeBERT mean-pool is weak (`~0.30` rank_acc). The old pretrained CodeBERT JEPA finetune reached `~0.75` mean-pool / `~0.78` predictor on a same-sample comparison. A scratch 6-layer RoBERTa with custom 16k BPE, Siamese loss, and SIGReg reached `0.7566` after 2h and `0.9217` after a 6h continuation on train-distribution v0 triples. This proves the easy-transform signal is learnable from scratch, but it is not yet evidence of general semantic judging.
 
 ## Data sources
 

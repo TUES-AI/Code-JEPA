@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Train a CodeBERT/RoBERTa JEPA ranker over Code-JEPA Parquet triples.
 
-This is the first real backbone trainer: context encoder is a trainable
-RoBERTa/CodeBERT model, target encoder is an EMA copy, and positives/negatives
+This is the first real backbone trainer: one trainable RoBERTa/CodeBERT
+encoder sees all views, SIGReg regularizes encoder outputs, and positives/negatives
 come from the prepared `views` + `triples` shards.
 """
 
@@ -26,7 +26,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import AutoConfig, AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from code_jepa.models import SlicedGaussianRegularizer
 
 
 @dataclass(frozen=True)
@@ -34,6 +41,7 @@ class TrainArgs:
     data_roots: list[str]
     output_dir: str
     model_name: str = "microsoft/codebert-base"
+    init: str = "pretrained"
     max_len: int = 256
     batch_size: int = 96
     steps: int = 1_000_000
@@ -45,7 +53,8 @@ class TrainArgs:
     rank_weight: float = 0.5
     inbatch_weight: float = 0.1
     temperature: float = 0.05
-    ema_decay: float = 0.996
+    sigreg_weight: float = 0.05
+    sigreg_slices: int = 64
     dropout: float = 0.1
     grad_clip: float = 1.0
     precision: str = "bf16"
@@ -149,6 +158,7 @@ def parse_args() -> TrainArgs:
     parser.add_argument("--data-roots", nargs="+", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--model-name", default="microsoft/codebert-base")
+    parser.add_argument("--init", choices=["pretrained", "scratch", "roberta_large_scratch"], default="pretrained")
     parser.add_argument("--max-len", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=96)
     parser.add_argument("--steps", type=int, default=1_000_000)
@@ -160,7 +170,8 @@ def parse_args() -> TrainArgs:
     parser.add_argument("--rank-weight", type=float, default=0.5)
     parser.add_argument("--inbatch-weight", type=float, default=0.1)
     parser.add_argument("--temperature", type=float, default=0.05)
-    parser.add_argument("--ema-decay", type=float, default=0.996)
+    parser.add_argument("--sigreg-weight", type=float, default=0.05)
+    parser.add_argument("--sigreg-slices", type=int, default=64)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
@@ -208,12 +219,10 @@ def main() -> None:
 def train(args: TrainArgs, pairs: list[ShardPair], out: Path) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
-    ctx = AutoModel.from_pretrained(args.model_name).to(device)
-    target = AutoModel.from_pretrained(args.model_name).to(device)
-    target.load_state_dict(ctx.state_dict())
-    target.eval().requires_grad_(False)
+    ctx = build_model(args).to(device)
     hidden_size = int(ctx.config.hidden_size)
     predictor = Predictor(hidden_size, args.dropout).to(device)
+    sigreg = SlicedGaussianRegularizer(num_slices=args.sigreg_slices).to(device)
 
     if args.gradient_checkpointing and hasattr(ctx, "gradient_checkpointing_enable"):
         ctx.gradient_checkpointing_enable()
@@ -240,8 +249,8 @@ def train(args: TrainArgs, pairs: list[ShardPair], out: Path) -> None:
         batch = sampler.next_batch(args.batch_size)
         metrics = train_step(
             ctx,
-            target,
             predictor,
+            sigreg,
             tokenizer,
             optimizer,
             scheduler,
@@ -282,8 +291,8 @@ def train(args: TrainArgs, pairs: list[ShardPair], out: Path) -> None:
 
 def train_step(
     ctx: nn.Module,
-    target: nn.Module,
     predictor: nn.Module,
+    sigreg: SlicedGaussianRegularizer,
     tokenizer: Any,
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
@@ -296,24 +305,31 @@ def train_step(
     predictor.train()
     anchors, positives, negatives = batch
     anchor_inputs = tokenize(tokenizer, anchors, args.max_len, device)
-    target_inputs = tokenize(tokenizer, positives + negatives, args.max_len, device)
+    view_inputs = tokenize(tokenizer, positives + negatives, args.max_len, device)
     amp_dtype = autocast_dtype(args.precision)
 
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype is not None)):
         za = encode(ctx, anchor_inputs)
-        pred = F.normalize(predictor(za), dim=-1)
-        with torch.no_grad():
-            z_target = encode(target, target_inputs)
-            zp, zn = z_target.chunk(2, dim=0)
-        sim_pos = torch.sum(pred * zp, dim=-1)
-        sim_neg = torch.sum(pred * zn, dim=-1)
+        zp, zn = encode(ctx, view_inputs).chunk(2, dim=0)
+        pred = predictor(za)
+        pred_n = F.normalize(pred, dim=-1)
+        zp_n = F.normalize(zp, dim=-1)
+        zn_n = F.normalize(zn, dim=-1)
+        sim_pos = torch.sum(pred_n * zp_n, dim=-1)
+        sim_neg = torch.sum(pred_n * zn_n, dim=-1)
         jepa_loss = F.mse_loss(pred, zp)
         rank_loss = F.relu(args.margin + sim_neg - sim_pos).mean()
-        logits = pred @ zp.T / args.temperature
+        logits = pred_n @ zp_n.T / args.temperature
         labels = torch.arange(pred.shape[0], device=pred.device)
         inbatch_loss = F.cross_entropy(logits, labels)
-        loss = jepa_loss + args.rank_weight * rank_loss + args.inbatch_weight * inbatch_loss
+        sigreg_loss = sigreg(torch.cat([za, zp, zn], dim=0))
+        loss = (
+            jepa_loss
+            + args.rank_weight * rank_loss
+            + args.inbatch_weight * inbatch_loss
+            + args.sigreg_weight * sigreg_loss
+        )
 
     if not torch.isfinite(loss):
         raise FloatingPointError(f"non-finite loss: {float(loss.detach().cpu())}")
@@ -325,7 +341,6 @@ def train_step(
     scaler.step(optimizer)
     scaler.update()
     scheduler.step()
-    ema_update(target, ctx, args.ema_decay)
 
     rank_acc = (sim_pos > sim_neg).float().mean()
     return {
@@ -333,6 +348,7 @@ def train_step(
         "jepa_loss": float(jepa_loss.detach().cpu()),
         "rank_loss": float(rank_loss.detach().cpu()),
         "inbatch_loss": float(inbatch_loss.detach().cpu()),
+        "sigreg_loss": float(sigreg_loss.detach().cpu()),
         "sim_pos": float(sim_pos.mean().detach().cpu()),
         "sim_neg": float(sim_neg.mean().detach().cpu()),
         "rank_acc": float(rank_acc.detach().cpu()),
@@ -359,10 +375,12 @@ def evaluate_batches(
     for _ in range(args.eval_batches):
         anchors, positives, negatives = sampler.next_batch(args.batch_size)
         anchor_inputs = tokenize(tokenizer, anchors, args.max_len, device)
-        target_inputs = tokenize(tokenizer, positives + negatives, args.max_len, device)
+        view_inputs = tokenize(tokenizer, positives + negatives, args.max_len, device)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype is not None)):
             pred = F.normalize(predictor(encode(model, anchor_inputs)), dim=-1)
-            zp, zn = encode(model, target_inputs).chunk(2, dim=0)
+            zp, zn = encode(model, view_inputs).chunk(2, dim=0)
+            zp = F.normalize(zp, dim=-1)
+            zn = F.normalize(zn, dim=-1)
             sim_pos = torch.sum(pred * zp, dim=-1)
             sim_neg = torch.sum(pred * zn, dim=-1)
             losses.append(float(F.relu(args.margin + sim_neg - sim_pos).mean().cpu()))
@@ -384,7 +402,7 @@ def evaluate_checkpoint(args: TrainArgs, pairs: list[ShardPair]) -> dict[str, fl
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     model_name = checkpoint.get("model_name", args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    model = AutoModel.from_pretrained(model_name).to(device)
+    model = model_from_checkpoint(checkpoint, model_name).to(device)
     hidden_size = int(model.config.hidden_size)
     predictor = Predictor(hidden_size, args.dropout).to(device)
     model.load_state_dict(checkpoint["ctx_model"])
@@ -393,12 +411,38 @@ def evaluate_checkpoint(args: TrainArgs, pairs: list[ShardPair]) -> dict[str, fl
     return evaluate_batches(model, predictor, tokenizer, sampler, args, device)
 
 
+def build_model(args: TrainArgs) -> nn.Module:
+    if args.init == "pretrained":
+        return AutoModel.from_pretrained(args.model_name)
+    config = AutoConfig.from_pretrained(args.model_name)
+    if args.init == "roberta_large_scratch":
+        if getattr(config, "model_type", "") != "roberta":
+            raise ValueError("--init roberta_large_scratch requires a RoBERTa/CodeBERT-style config")
+        config.hidden_size = 1024
+        config.num_hidden_layers = 24
+        config.num_attention_heads = 16
+        config.intermediate_size = 4096
+        if hasattr(config, "type_vocab_size"):
+            config.type_vocab_size = 1
+    return AutoModel.from_config(config)
+
+
+def model_from_checkpoint(checkpoint: dict[str, Any], fallback_model_name: str) -> nn.Module:
+    config_dict = checkpoint.get("model_config")
+    if config_dict:
+        model_type = config_dict.get("model_type")
+        config = AutoConfig.for_model(model_type) if model_type else AutoConfig.from_pretrained(fallback_model_name)
+        config.update(config_dict)
+        return AutoModel.from_config(config)
+    return AutoModel.from_pretrained(fallback_model_name)
+
+
 def encode(model: nn.Module, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
     output = model(**inputs)
     hidden = output.last_hidden_state
     mask = inputs["attention_mask"].unsqueeze(-1).to(hidden.dtype)
     pooled = torch.sum(hidden * mask, dim=1) / torch.clamp(torch.sum(mask, dim=1), min=1.0)
-    return F.normalize(pooled.float(), dim=-1)
+    return pooled.float()
 
 
 def tokenize(tokenizer: Any, texts: list[str], max_len: int, device: torch.device) -> dict[str, torch.Tensor]:
@@ -412,20 +456,13 @@ def tokenize(tokenizer: Any, texts: list[str], max_len: int, device: torch.devic
     return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
 
 
-def ema_update(target: nn.Module, source: nn.Module, decay: float) -> None:
-    with torch.no_grad():
-        for target_param, source_param in zip(target.parameters(), source.parameters()):
-            target_param.data.mul_(decay).add_(source_param.data, alpha=1.0 - decay)
-        for target_buffer, source_buffer in zip(target.buffers(), source.buffers()):
-            target_buffer.copy_(source_buffer)
-
-
 def save_light_checkpoint(
     out: Path, ctx: nn.Module, predictor: nn.Module, args: TrainArgs, step: int
 ) -> None:
     payload = {
         "step": step,
         "model_name": args.model_name,
+        "model_config": ctx.config.to_dict() if hasattr(ctx, "config") else {},
         "ctx_model": {k: v.detach().cpu() for k, v in ctx.state_dict().items()},
         "predictor": {k: v.detach().cpu() for k, v in predictor.state_dict().items()},
         "args": asdict(args),

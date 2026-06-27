@@ -1,4 +1,4 @@
-from code_jepa.transforms.python_ast import hard_negative_views, positive_views
+from code_jepa.transforms.python_ast import extra_hard_negative_views, hard_negative_views, positive_views
 
 
 SAMPLE = '''
@@ -31,3 +31,18 @@ def test_hard_negatives_compile_and_record_spans() -> None:
 def test_comparison_negative_changes_equality() -> None:
     view = next(view for view in hard_negative_views(SAMPLE) if view.name == "flip_comparison")
     assert "!=" in view.code or "<=" in view.code or ">=" in view.code
+
+
+def test_extra_hard_negatives_compile_and_expand_transform_family() -> None:
+    sample = '''
+def rank(items, reverse=False):
+    values = sorted(items, reverse=reverse)
+    if values[0] in items:
+        return values[0] + 1
+    return None
+'''
+    views = extra_hard_negative_views(sample, max_views=8)
+    names = {view.name for view in views}
+    assert names & {"flip_membership_or_identity", "flip_arithmetic_operator", "flip_subscript_index", "flip_sort_reverse"}
+    assert all(view.role == "negative" for view in views)
+    assert all(view.changed_spans for view in views)

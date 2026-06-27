@@ -48,8 +48,29 @@ def hard_negative_views(code: str, *, max_views: int = 6) -> list[TransformResul
         _safe_transform(_swap_call_args, parsed.tree, code),
         _safe_transform(_wrong_variable, parsed.tree, code),
         _safe_transform(_flip_small_integer, parsed.tree, code),
+        *_harder_negative_candidates(parsed.tree, code),
     ]
     return _dedupe_valid(code, candidates, max_views=max_views)
+
+
+def extra_hard_negative_views(code: str, *, max_views: int = 8) -> list[TransformResult]:
+    parsed = parse_and_compile(code)
+    if parsed.tree is None:
+        return []
+    return _dedupe_valid(code, _harder_negative_candidates(parsed.tree, code), max_views=max_views)
+
+
+def _harder_negative_candidates(tree: ast.AST, code: str) -> list[TransformResult | None]:
+    return [
+        _safe_transform(_flip_membership_or_identity, tree, code),
+        _safe_transform(_negate_first_condition, tree, code),
+        _safe_transform(_flip_arithmetic_operator, tree, code),
+        _safe_transform(_flip_subscript_index, tree, code),
+        _safe_transform(_flip_default_value, tree, code),
+        _safe_transform(_flip_sort_reverse, tree, code),
+        _safe_transform(_remove_return_value, tree, code),
+        _safe_transform(_drop_await, tree, code),
+    ]
 
 
 def _safe_transform(fn, *args) -> TransformResult | None:
@@ -390,4 +411,355 @@ def _flip_small_integer(tree: ast.AST, code: str) -> TransformResult | None:
         confidence="behavior_impacting",
         changed_spans=mutator.changed,
         metadata={"negative_type": "small_integer"},
+    )
+
+
+_MEMBERSHIP_FLIPS: dict[type[ast.cmpop], ast.cmpop] = {
+    ast.In: ast.NotIn(),
+    ast.NotIn: ast.In(),
+    ast.Is: ast.IsNot(),
+    ast.IsNot: ast.Is(),
+}
+
+
+class _FirstMembershipOrIdentityFlip(ast.NodeTransformer):
+    def __init__(self, source_code: str) -> None:
+        self.source_code = source_code
+        self.changed: list[dict[str, Any]] = []
+
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        if self.changed:
+            return node
+        for index, op in enumerate(node.ops):
+            replacement = _MEMBERSHIP_FLIPS.get(type(op))
+            if replacement is None:
+                continue
+            old_op = type(op).__name__
+            node.ops[index] = replacement
+            span = node_span(node, self.source_code) or {}
+            span.update({"kind": "membership_or_identity", "original": old_op, "replacement": type(replacement).__name__})
+            self.changed.append(span)
+            break
+        return node
+
+
+def _flip_membership_or_identity(tree: ast.AST, code: str) -> TransformResult | None:
+    new_tree = copy.deepcopy(tree)
+    mutator = _FirstMembershipOrIdentityFlip(code)
+    mutator.visit(new_tree)
+    if not mutator.changed:
+        return None
+    return TransformResult(
+        name="flip_membership_or_identity",
+        role="negative",
+        code=unparse(new_tree),
+        confidence="behavior_impacting",
+        changed_spans=mutator.changed,
+        metadata={"negative_type": "membership_or_identity"},
+    )
+
+
+class _FirstConditionNegator(ast.NodeTransformer):
+    def __init__(self, source_code: str) -> None:
+        self.source_code = source_code
+        self.changed: list[dict[str, Any]] = []
+
+    def visit_If(self, node: ast.If) -> ast.AST:
+        self.generic_visit(node)
+        if self.changed:
+            return node
+        old_kind = type(node.test).__name__
+        node.test = _negated_expr(node.test)
+        span = node_span(node, self.source_code) or {}
+        span.update({"kind": "condition_negation", "original": old_kind})
+        self.changed.append(span)
+        return node
+
+    def visit_While(self, node: ast.While) -> ast.AST:
+        self.generic_visit(node)
+        if self.changed:
+            return node
+        old_kind = type(node.test).__name__
+        node.test = _negated_expr(node.test)
+        span = node_span(node, self.source_code) or {}
+        span.update({"kind": "condition_negation", "original": old_kind})
+        self.changed.append(span)
+        return node
+
+
+def _negated_expr(expr: ast.expr) -> ast.expr:
+    if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, ast.Not):
+        return expr.operand
+    return ast.UnaryOp(op=ast.Not(), operand=expr)
+
+
+def _negate_first_condition(tree: ast.AST, code: str) -> TransformResult | None:
+    new_tree = copy.deepcopy(tree)
+    mutator = _FirstConditionNegator(code)
+    mutator.visit(new_tree)
+    if not mutator.changed:
+        return None
+    return TransformResult(
+        name="negate_condition",
+        role="negative",
+        code=unparse(new_tree),
+        confidence="behavior_impacting",
+        changed_spans=mutator.changed,
+        metadata={"negative_type": "condition_negation"},
+    )
+
+
+_BINOP_FLIPS: dict[type[ast.operator], ast.operator] = {
+    ast.Add: ast.Sub(),
+    ast.Sub: ast.Add(),
+    ast.Mult: ast.FloorDiv(),
+    ast.FloorDiv: ast.Mult(),
+    ast.Mod: ast.Mult(),
+}
+
+
+class _FirstArithmeticFlip(ast.NodeTransformer):
+    def __init__(self, source_code: str) -> None:
+        self.source_code = source_code
+        self.changed: list[dict[str, Any]] = []
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+        self.generic_visit(node)
+        if self.changed:
+            return node
+        replacement = _BINOP_FLIPS.get(type(node.op))
+        if replacement is None:
+            return node
+        old_op = type(node.op).__name__
+        node.op = replacement
+        span = node_span(node, self.source_code) or {}
+        span.update({"kind": "arithmetic_operator", "original": old_op, "replacement": type(replacement).__name__})
+        self.changed.append(span)
+        return node
+
+
+def _flip_arithmetic_operator(tree: ast.AST, code: str) -> TransformResult | None:
+    new_tree = copy.deepcopy(tree)
+    mutator = _FirstArithmeticFlip(code)
+    mutator.visit(new_tree)
+    if not mutator.changed:
+        return None
+    return TransformResult(
+        name="flip_arithmetic_operator",
+        role="negative",
+        code=unparse(new_tree),
+        confidence="behavior_impacting",
+        changed_spans=mutator.changed,
+        metadata={"negative_type": "arithmetic_operator"},
+    )
+
+
+class _FirstSubscriptIndexFlip(ast.NodeTransformer):
+    def __init__(self, source_code: str) -> None:
+        self.source_code = source_code
+        self.changed: list[dict[str, Any]] = []
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+        self.generic_visit(node)
+        if self.changed:
+            return node
+        target = node.slice
+        if not isinstance(target, ast.Constant) or not isinstance(target.value, int) or isinstance(target.value, bool):
+            return node
+        if target.value not in {0, 1, -1}:
+            return node
+        old = target.value
+        target.value = 0 if old == 1 else 1
+        span = node_span(node, self.source_code) or {}
+        span.update({"kind": "subscript_index", "original": old, "replacement": target.value})
+        self.changed.append(span)
+        return node
+
+
+def _flip_subscript_index(tree: ast.AST, code: str) -> TransformResult | None:
+    new_tree = copy.deepcopy(tree)
+    mutator = _FirstSubscriptIndexFlip(code)
+    mutator.visit(new_tree)
+    if not mutator.changed:
+        return None
+    return TransformResult(
+        name="flip_subscript_index",
+        role="negative",
+        code=unparse(new_tree),
+        confidence="behavior_impacting",
+        changed_spans=mutator.changed,
+        metadata={"negative_type": "subscript_index"},
+    )
+
+
+def _flipped_constant(value: Any) -> Any | None:
+    if isinstance(value, bool):
+        return not value
+    if value is None:
+        return 0
+    if isinstance(value, int):
+        if value in {0, 1, -1}:
+            return 0 if value == 1 else 1
+        return value + 1
+    if isinstance(value, str):
+        return value + "_wrong"
+    return None
+
+
+class _FirstDefaultValueFlip(ast.NodeTransformer):
+    def __init__(self, source_code: str) -> None:
+        self.source_code = source_code
+        self.changed: list[dict[str, Any]] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        self.generic_visit(node)
+        self._flip_default(node)
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        self.generic_visit(node)
+        self._flip_default(node)
+        return node
+
+    def _flip_default(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        if self.changed:
+            return
+        for default in list(node.args.defaults) + list(node.args.kw_defaults):
+            if not isinstance(default, ast.Constant):
+                continue
+            replacement = _flipped_constant(default.value)
+            if replacement is None or replacement == default.value:
+                continue
+            old = default.value
+            default.value = replacement
+            span = node_span(node, self.source_code) or {}
+            span.update({"kind": "default_value", "original": old, "replacement": replacement})
+            self.changed.append(span)
+            return
+
+
+def _flip_default_value(tree: ast.AST, code: str) -> TransformResult | None:
+    new_tree = copy.deepcopy(tree)
+    mutator = _FirstDefaultValueFlip(code)
+    mutator.visit(new_tree)
+    if not mutator.changed:
+        return None
+    return TransformResult(
+        name="flip_default_value",
+        role="negative",
+        code=unparse(new_tree),
+        confidence="behavior_impacting",
+        changed_spans=mutator.changed,
+        metadata={"negative_type": "default_value"},
+    )
+
+
+class _FirstSortReverseFlip(ast.NodeTransformer):
+    def __init__(self, source_code: str) -> None:
+        self.source_code = source_code
+        self.changed: list[dict[str, Any]] = []
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        if self.changed:
+            return node
+        func_name = ""
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            func_name = node.func.attr
+        if func_name not in {"sorted", "sort"}:
+            return node
+        for keyword in node.keywords:
+            if keyword.arg == "reverse" and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, bool):
+                old = keyword.value.value
+                keyword.value.value = not old
+                span = node_span(node, self.source_code) or {}
+                span.update({"kind": "sort_reverse", "original": old, "replacement": not old})
+                self.changed.append(span)
+                return node
+        node.keywords.append(ast.keyword(arg="reverse", value=ast.Constant(value=True)))
+        span = node_span(node, self.source_code) or {}
+        span.update({"kind": "sort_reverse", "original": None, "replacement": True})
+        self.changed.append(span)
+        return node
+
+
+def _flip_sort_reverse(tree: ast.AST, code: str) -> TransformResult | None:
+    new_tree = copy.deepcopy(tree)
+    mutator = _FirstSortReverseFlip(code)
+    mutator.visit(new_tree)
+    if not mutator.changed:
+        return None
+    return TransformResult(
+        name="flip_sort_reverse",
+        role="negative",
+        code=unparse(new_tree),
+        confidence="behavior_impacting",
+        changed_spans=mutator.changed,
+        metadata={"negative_type": "sort_reverse"},
+    )
+
+
+class _FirstReturnValueRemover(ast.NodeTransformer):
+    def __init__(self, source_code: str) -> None:
+        self.source_code = source_code
+        self.changed: list[dict[str, Any]] = []
+
+    def visit_Return(self, node: ast.Return) -> ast.AST:
+        self.generic_visit(node)
+        if self.changed or node.value is None:
+            return node
+        old_kind = type(node.value).__name__
+        node.value = ast.Constant(value=None)
+        span = node_span(node, self.source_code) or {}
+        span.update({"kind": "return_value", "original": old_kind, "replacement": "None"})
+        self.changed.append(span)
+        return node
+
+
+def _remove_return_value(tree: ast.AST, code: str) -> TransformResult | None:
+    new_tree = copy.deepcopy(tree)
+    mutator = _FirstReturnValueRemover(code)
+    mutator.visit(new_tree)
+    if not mutator.changed:
+        return None
+    return TransformResult(
+        name="remove_return_value",
+        role="negative",
+        code=unparse(new_tree),
+        confidence="behavior_impacting",
+        changed_spans=mutator.changed,
+        metadata={"negative_type": "return_value_removed"},
+    )
+
+
+class _FirstAwaitDropper(ast.NodeTransformer):
+    def __init__(self, source_code: str) -> None:
+        self.source_code = source_code
+        self.changed: list[dict[str, Any]] = []
+
+    def visit_Await(self, node: ast.Await) -> ast.AST:
+        self.generic_visit(node)
+        if self.changed:
+            return node
+        span = node_span(node, self.source_code) or {}
+        span.update({"kind": "await_removed"})
+        self.changed.append(span)
+        return node.value
+
+
+def _drop_await(tree: ast.AST, code: str) -> TransformResult | None:
+    new_tree = copy.deepcopy(tree)
+    mutator = _FirstAwaitDropper(code)
+    mutator.visit(new_tree)
+    if not mutator.changed:
+        return None
+    return TransformResult(
+        name="drop_await",
+        role="negative",
+        code=unparse(new_tree),
+        confidence="behavior_impacting",
+        changed_spans=mutator.changed,
+        metadata={"negative_type": "await_removed"},
     )

@@ -368,20 +368,20 @@ def compute_losses(
     negative = model(**batch["negative"])
 
     semantic_prediction = model.semantic_predictor(anchor.semantic)
-    semantic_jepa = F.mse_loss(semantic_prediction, positive.semantic.detach())
+    semantic_jepa = F.mse_loss(semantic_prediction, positive.semantic)
 
     local_prediction = model.local_predictor(anchor.local)
     local_jepa = local_prediction_loss(
         local_prediction,
         anchor.attention_mask,
-        positive.local.detach(),
+        positive.local,
         positive.attention_mask,
     )
 
     if cfg.symmetric:
         reverse_semantic_prediction = model.semantic_predictor(positive.semantic)
         semantic_jepa = 0.5 * (
-            semantic_jepa + F.mse_loss(reverse_semantic_prediction, anchor.semantic.detach())
+            semantic_jepa + F.mse_loss(reverse_semantic_prediction, anchor.semantic)
         )
         reverse_local_prediction = model.local_predictor(positive.local)
         local_jepa = 0.5 * (
@@ -389,31 +389,31 @@ def compute_losses(
             + local_prediction_loss(
                 reverse_local_prediction,
                 positive.attention_mask,
-                anchor.local.detach(),
+                anchor.local,
                 anchor.attention_mask,
             )
         )
 
     semantic_rank = margin_rank_loss(
         semantic_prediction,
-        positive.semantic.detach(),
-        negative.semantic.detach(),
+        positive.semantic,
+        negative.semantic,
         cfg.margin,
     )
     local_rank = margin_rank_loss(
         pooled_local(local_prediction, anchor.attention_mask),
-        pooled_local(positive.local.detach(), positive.attention_mask),
-        pooled_local(negative.local.detach(), negative.attention_mask),
+        pooled_local(positive.local, positive.attention_mask),
+        pooled_local(negative.local, negative.attention_mask),
         cfg.margin,
     )
     sigreg = model.semantic_sigreg(
-        torch.cat([anchor.semantic, positive.semantic, negative.semantic], dim=0)
+        torch.cat([anchor.pooled, positive.pooled, negative.pooled], dim=0)
     ) + model.local_sigreg(
         torch.cat(
             [
-                flatten_masked_tokens(anchor.local, anchor.attention_mask),
-                flatten_masked_tokens(positive.local, positive.attention_mask),
-                flatten_masked_tokens(negative.local, negative.attention_mask),
+                flatten_masked_tokens(anchor.last_hidden_state, anchor.attention_mask),
+                flatten_masked_tokens(positive.last_hidden_state, positive.attention_mask),
+                flatten_masked_tokens(negative.last_hidden_state, negative.attention_mask),
             ],
             dim=0,
         )

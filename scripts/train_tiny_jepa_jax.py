@@ -14,6 +14,7 @@ import random
 import sys
 import time
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Iterable
 
@@ -55,8 +56,8 @@ class TrainConfig:
     rank_weight: float = 0.25
     inbatch_weight: float = 0.1
     inbatch_temperature: float = 0.1
-    variance_weight: float = 0.05
-    std_target: float = 0.05
+    sigreg_weight: float = 0.05
+    sigreg_slices: int = 64
     log_every: int = 20
     save_every: int = 250
 
@@ -97,8 +98,7 @@ class TinyEncoder(nn.Module):
         h = nn.LayerNorm(name="final_ln")(h)
         mask_f = mask[..., None].astype(h.dtype)
         pooled = jnp.sum(h * mask_f, axis=1) / jnp.maximum(jnp.sum(mask_f, axis=1), 1.0)
-        z = nn.Dense(self.z_dim, name="proj")(pooled)
-        return l2_normalize(z)
+        return nn.Dense(self.z_dim, name="proj")(pooled)
 
 
 class TinyCodeJepa(nn.Module):
@@ -128,12 +128,20 @@ class TinyCodeJepa(nn.Module):
         pred = nn.Dense(self.cfg.d_model, name="pred_in")(za)
         pred = nn.gelu(pred)
         pred = nn.Dense(self.cfg.z_dim, name="pred_out")(pred)
-        pred = l2_normalize(pred)
         return za, zp, zn, pred
 
 
 def l2_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
     return x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
+
+
+def sliced_gaussian_sigreg(samples: jnp.ndarray, num_slices: int) -> jnp.ndarray:
+    directions = jax.random.normal(jax.random.PRNGKey(0), (samples.shape[-1], num_slices), dtype=samples.dtype)
+    directions = l2_normalize(directions, eps=1e-6)
+    projected = samples @ directions
+    mean = jnp.mean(projected, axis=0)
+    var = jnp.var(projected, axis=0)
+    return jnp.mean(jnp.square(mean) + jnp.square(var - 1.0))
 
 
 class TrainState(train_state.TrainState):
@@ -167,8 +175,8 @@ def main() -> None:
             cfg.rank_weight,
             cfg.inbatch_weight,
             cfg.inbatch_temperature,
-            cfg.variance_weight,
-            cfg.std_target,
+            cfg.sigreg_weight,
+            cfg.sigreg_slices,
         )
         if step == 1 or step % cfg.log_every == 0:
             record = {"event": "train", "step": step, "elapsed_s": round(time.time() - start, 2)}
@@ -202,8 +210,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--rank-weight", type=float, default=0.25)
     parser.add_argument("--inbatch-weight", type=float, default=0.1)
     parser.add_argument("--inbatch-temperature", type=float, default=0.1)
-    parser.add_argument("--variance-weight", type=float, default=0.05)
-    parser.add_argument("--std-target", type=float, default=0.05)
+    parser.add_argument("--sigreg-weight", type=float, default=0.05)
+    parser.add_argument("--sigreg-slices", type=int, default=64)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-every", type=int, default=250)
     return TrainConfig(**vars(parser.parse_args()))
@@ -303,7 +311,7 @@ def sample_batch(
     return {key: jnp.asarray(value[idx]) for key, value in arrays.items()}
 
 
-@jax.jit
+@partial(jax.jit, static_argnames=("sigreg_slices",))
 def train_step(
     state: TrainState,
     batch: dict[str, jnp.ndarray],
@@ -311,8 +319,8 @@ def train_step(
     rank_weight: float,
     inbatch_weight: float,
     inbatch_temperature: float,
-    variance_weight: float,
-    std_target: float,
+    sigreg_weight: float,
+    sigreg_slices: int,
 ) -> tuple[TrainState, dict[str, jnp.ndarray]]:
     def loss_fn(params):
         za, zp, zn, pred = state.apply_fn(
@@ -324,39 +332,33 @@ def train_step(
             batch["negative_tokens"],
             batch["negative_mask"],
         )
-        zp_sg = jax.lax.stop_gradient(zp)
-        zn_sg = jax.lax.stop_gradient(zn)
-        pred_loss = jnp.mean(jnp.square(pred - zp_sg))
-        sim_pos = jnp.sum(za * zp_sg, axis=-1)
-        sim_neg = jnp.sum(za * zn_sg, axis=-1)
+        pred_loss = jnp.mean(jnp.square(pred - zp))
+        pred_n = l2_normalize(pred)
+        zp_n = l2_normalize(zp)
+        zn_n = l2_normalize(zn)
+        sim_pos = jnp.sum(pred_n * zp_n, axis=-1)
+        sim_neg = jnp.sum(pred_n * zn_n, axis=-1)
         rank_loss = jnp.mean(jnp.maximum(0.0, margin + sim_neg - sim_pos))
 
-        logits = (za @ zp_sg.T) / inbatch_temperature
+        logits = (pred_n @ zp_n.T) / inbatch_temperature
         labels = jnp.arange(logits.shape[0])
         inbatch_loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
 
         embeds = jnp.concatenate([za, zp, zn], axis=0)
-        std = jnp.sqrt(jnp.var(embeds, axis=0) + 1e-6)
-        variance_loss = jnp.mean(jnp.square(jnp.maximum(0.0, std_target - std)))
-        mean_loss = jnp.mean(jnp.square(jnp.mean(embeds, axis=0)))
+        sigreg_loss = sliced_gaussian_sigreg(embeds, sigreg_slices)
+        embedding_std = jnp.mean(jnp.sqrt(jnp.var(embeds, axis=0) + 1e-6))
 
-        total = (
-            pred_loss
-            + rank_weight * rank_loss
-            + inbatch_weight * inbatch_loss
-            + variance_weight * (variance_loss + mean_loss)
-        )
+        total = pred_loss + rank_weight * rank_loss + inbatch_weight * inbatch_loss + sigreg_weight * sigreg_loss
         metrics = {
             "loss": total,
             "pred_loss": pred_loss,
             "rank_loss": rank_loss,
             "inbatch_loss": inbatch_loss,
-            "variance_loss": variance_loss,
-            "mean_loss": mean_loss,
+            "sigreg_loss": sigreg_loss,
             "sim_pos": jnp.mean(sim_pos),
             "sim_neg": jnp.mean(sim_neg),
             "sim_gap": jnp.mean(sim_pos - sim_neg),
-            "std_mean": jnp.mean(std),
+            "embedding_std": embedding_std,
         }
         return total, metrics
 
