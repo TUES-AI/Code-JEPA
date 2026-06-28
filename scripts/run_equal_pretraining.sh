@@ -9,7 +9,7 @@ ASSET_ROOT="${ASSET_ROOT:-offline_assets/code-jepa-small}"
 TOKENIZER_DIR="${TOKENIZER_DIR:-assets/tokenizers/codesearchnet-python/bpe16k}"
 PRETRAIN_ROOT="${PRETRAIN_ROOT:-$ASSET_ROOT/pretrain/codesearchnet-python}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-runs/equal-small-unixcoder-pretrain}"
-STAGES="${STAGES:-transform-v0 transform-v1 transform-v2}"
+STAGES="${STAGES:-transform-v0}"
 
 STEPS="${STEPS:-200000}"
 DURATION_HOURS="${DURATION_HOURS:-0}"

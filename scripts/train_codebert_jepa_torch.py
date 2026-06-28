@@ -405,8 +405,12 @@ def train_step(
         raise FloatingPointError(f"non-finite loss: {float(loss.detach().cpu())}")
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
-    grad_norm = torch.nn.utils.clip_grad_norm_(
-        list(ctx.parameters()) + list(predictor.parameters()), args.grad_clip
+    grad_norm = float(
+        torch.nn.utils.clip_grad_norm_(
+            list(ctx.parameters()) + list(predictor.parameters()), args.grad_clip
+        )
+        .detach()
+        .cpu()
     )
     scaler.step(optimizer)
     scaler.update()
@@ -422,7 +426,9 @@ def train_step(
         "sim_pos": float(sim_pos.mean().detach().cpu()),
         "sim_neg": float(sim_neg.mean().detach().cpu()),
         "rank_acc": float(rank_acc.detach().cpu()),
-        "grad_norm": float(torch.as_tensor(grad_norm).detach().cpu()),
+        "grad_norm": round(grad_norm, 4),
+        "grad_clipped": grad_norm > args.grad_clip,
+        "grad_exploding": grad_norm > 5.0 * args.grad_clip,
     }
 
 
@@ -742,9 +748,14 @@ def log(out: Path, record: dict[str, Any]) -> None:
     record = dict(record)
     record.setdefault("time", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     line = json.dumps(record, sort_keys=True)
-    print(line, flush=True)
+    # Always write to metrics.jsonl (primary log, safe for parallel jobs)
     with (out / "metrics.jsonl").open("a") as f:
         f.write(line + "\n")
+        f.flush()
+    # Print non-train events to stdout so SLURM log shows progress milestones
+    event = record.get("event", "")
+    if event != "train" or record.get("grad_exploding"):
+        print(line, flush=True)
 
 
 if __name__ == "__main__":
