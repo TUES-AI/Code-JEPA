@@ -18,6 +18,7 @@ venv/
 /runs/
 /checkpoints/
 /artifacts/
+/offline_assets/
 *.parquet
 *.arrow
 *.jsonl.zst

@@ -63,6 +63,28 @@ Use two pretraining tiers:
 Every run inside a tier should use the same RoBERTa configuration unless the
 ablation explicitly changes representation or pooling.
 
+Concrete small-tier preset:
+
+```text
+small-unixcoder-code-jepa
+vocab size: 16,384 plus UniXcoder mode tokens when tokenizer-backed
+hidden size: 512
+layers: 6
+attention heads: 8
+FFN/intermediate size: 2,048
+max sequence length: 512 for config inspection; trainers may use 256-token runs
+LM head: tied to token embeddings
+unique parameters: ~27.8M
+```
+
+This is a UniXcoder-compatible small variant at the mode-prefix and attention
+mask level, not a full reproduction of UniXcoder's generation-heavy pretraining.
+For Code-JEPA small-tier runs, use its encoder-only mode with the same
+positive/hard-negative losses as the other RoBERTa-style ablations. The
+25-30M parameter target assumes the Code-JEPA 16k BPE tokenizer; using the
+50k CodeBERT/UniXcoder tokenizer makes the embedding table too large for this
+small tier.
+
 Report these pretraining diagnostics:
 
 ```text
@@ -427,8 +449,10 @@ traditional ablations.
 - The first runnable downstream benchmark is CodeSearchNet Python because this
   repo already has partial support, but the full matched pretraining target is
   balanced CodeSearchNet across Ruby, Java, Python, PHP, Go, and JavaScript.
-- POJ-104 and BigCloneBench require loaders/evaluators before clone-detection
-  results can be filled.
+- POJ-104 and BigCloneBench are wired through
+  `scripts/finetune_clone_benchmarks.py`; use
+  `scripts/run_equal_pretraining.sh` and `scripts/run_equal_finetuning.sh` for
+  matched small-tier runs.
 - Non-Python hard-negative claims require non-Python transform coverage; until
   then, hard-negative supervision is Python-only and multilingual data contributes
   broad code/doc representation learning.

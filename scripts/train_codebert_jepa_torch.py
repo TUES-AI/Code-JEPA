@@ -26,14 +26,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from transformers import AutoConfig, AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import AutoConfig, AutoModel, AutoTokenizer, RobertaTokenizerFast
+from transformers import get_cosine_schedule_with_warmup
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from code_jepa.models import SlicedGaussianRegularizer
+from code_jepa.models import (
+    ENCODER_ONLY,
+    SlicedGaussianRegularizer,
+    SmallUniXcoder,
+    count_parameters,
+    ensure_unixcoder_special_tokens,
+    small_unixcoder_config,
+    unixcoder_tokenize,
+)
 
 
 @dataclass(frozen=True)
@@ -158,7 +167,11 @@ def parse_args() -> TrainArgs:
     parser.add_argument("--data-roots", nargs="+", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--model-name", default="microsoft/codebert-base")
-    parser.add_argument("--init", choices=["pretrained", "scratch", "roberta_large_scratch"], default="pretrained")
+    parser.add_argument(
+        "--init",
+        choices=["pretrained", "scratch", "roberta_large_scratch", "unixcoder_small_scratch"],
+        default="pretrained",
+    )
     parser.add_argument("--max-len", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=96)
     parser.add_argument("--steps", type=int, default=1_000_000)
@@ -176,7 +189,11 @@ def parse_args() -> TrainArgs:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
+    parser.add_argument(
+        "--no-gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_false",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--eval-every", type=int, default=200)
@@ -203,10 +220,18 @@ def main() -> None:
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(json.dumps(asdict(args), indent=2, sort_keys=True) + "\n")
+    (out / "config.json").write_text(
+        json.dumps(asdict(args), indent=2, sort_keys=True) + "\n"
+    )
 
-    pairs = discover_shards([Path(root) for root in args.data_roots], max_shards=args.max_shards)
-    log(out, {"event": "startup", "pairs": len(pairs), "args": asdict(args), "device": device_name()})
+    pairs = discover_shards(
+        [Path(root) for root in args.data_roots],
+        max_shards=args.max_shards,
+    )
+    log(
+        out,
+        {"event": "startup", "pairs": len(pairs), "args": asdict(args), "device": device_name()},
+    )
 
     if args.eval_only:
         metrics = evaluate_checkpoint(args, pairs)
@@ -218,11 +243,27 @@ def main() -> None:
 
 def train(args: TrainArgs, pairs: list[ShardPair], out: Path) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
-    ctx = build_model(args).to(device)
+    tokenizer = load_tokenizer(args.model_name)
+    if args.init == "unixcoder_small_scratch":
+        added = ensure_unixcoder_special_tokens(tokenizer)
+        if added:
+            log(out, {"event": "tokenizer_added_unixcoder_tokens", "count": added})
+    ctx = build_model(args, tokenizer).to(device)
     hidden_size = int(ctx.config.hidden_size)
     predictor = Predictor(hidden_size, args.dropout).to(device)
     sigreg = SlicedGaussianRegularizer(num_slices=args.sigreg_slices).to(device)
+    parameter_count = count_parameters(ctx)
+    if args.init == "unixcoder_small_scratch":
+        validate_small_unixcoder_size(parameter_count, tokenizer)
+    log(
+        out,
+        {
+            "event": "model_built",
+            "model_class": model_class_name(ctx),
+            "unique_parameters": parameter_count,
+            "hidden_size": hidden_size,
+        },
+    )
 
     if args.gradient_checkpointing and hasattr(ctx, "gradient_checkpointing_enable"):
         ctx.gradient_checkpointing_enable()
@@ -275,10 +316,10 @@ def train(args: TrainArgs, pairs: list[ShardPair], out: Path) -> None:
         if args.dry_run_batches and step >= args.dry_run_batches:
             log(out, {"event": "dry_run_done", "step": step})
             break
-        if step % args.eval_every == 0:
+        if args.eval_every > 0 and step % args.eval_every == 0:
             eval_metrics = evaluate_batches(ctx, predictor, tokenizer, eval_sampler, args, device)
             log(out, {"event": "eval", "step": step, **eval_metrics})
-        if step % args.save_every == 0:
+        if args.save_every > 0 and step % args.save_every == 0:
             save_light_checkpoint(out, ctx, predictor, args, step)
         if args.s3_output_prefix and args.s3_sync_every > 0 and step % args.s3_sync_every == 0:
             sync_s3(out, args.s3_output_prefix)
@@ -304,12 +345,29 @@ def train_step(
     ctx.train()
     predictor.train()
     anchors, positives, negatives = batch
-    anchor_inputs = tokenize(tokenizer, anchors, args.max_len, device)
-    view_inputs = tokenize(tokenizer, positives + negatives, args.max_len, device)
+    unixcoder_mode = isinstance(ctx, SmallUniXcoder)
+    anchor_inputs = tokenize(
+        tokenizer,
+        anchors,
+        args.max_len,
+        device,
+        unixcoder_mode=unixcoder_mode,
+    )
+    view_inputs = tokenize(
+        tokenizer,
+        positives + negatives,
+        args.max_len,
+        device,
+        unixcoder_mode=unixcoder_mode,
+    )
     amp_dtype = autocast_dtype(args.precision)
 
     optimizer.zero_grad(set_to_none=True)
-    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype is not None)):
+    with torch.autocast(
+        device_type=device.type,
+        dtype=amp_dtype,
+        enabled=(device.type == "cuda" and amp_dtype is not None),
+    ):
         za = encode(ctx, anchor_inputs)
         zp, zn = encode(ctx, view_inputs).chunk(2, dim=0)
         pred = predictor(za)
@@ -372,11 +430,28 @@ def evaluate_batches(
     sim_pos_values = []
     sim_neg_values = []
     amp_dtype = autocast_dtype(args.precision)
+    unixcoder_mode = isinstance(model, SmallUniXcoder)
     for _ in range(args.eval_batches):
         anchors, positives, negatives = sampler.next_batch(args.batch_size)
-        anchor_inputs = tokenize(tokenizer, anchors, args.max_len, device)
-        view_inputs = tokenize(tokenizer, positives + negatives, args.max_len, device)
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype is not None)):
+        anchor_inputs = tokenize(
+            tokenizer,
+            anchors,
+            args.max_len,
+            device,
+            unixcoder_mode=unixcoder_mode,
+        )
+        view_inputs = tokenize(
+            tokenizer,
+            positives + negatives,
+            args.max_len,
+            device,
+            unixcoder_mode=unixcoder_mode,
+        )
+        with torch.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=(device.type == "cuda" and amp_dtype is not None),
+        ):
             pred = F.normalize(predictor(encode(model, anchor_inputs)), dim=-1)
             zp, zn = encode(model, view_inputs).chunk(2, dim=0)
             zp = F.normalize(zp, dim=-1)
@@ -401,7 +476,12 @@ def evaluate_checkpoint(args: TrainArgs, pairs: list[ShardPair]) -> dict[str, fl
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     model_name = checkpoint.get("model_name", args.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    tokenizer = load_tokenizer(model_name)
+    if (
+        checkpoint.get("model_class") == "SmallUniXcoder"
+        or args.init == "unixcoder_small_scratch"
+    ):
+        ensure_unixcoder_special_tokens(tokenizer)
     model = model_from_checkpoint(checkpoint, model_name).to(device)
     hidden_size = int(model.config.hidden_size)
     predictor = Predictor(hidden_size, args.dropout).to(device)
@@ -411,13 +491,24 @@ def evaluate_checkpoint(args: TrainArgs, pairs: list[ShardPair]) -> dict[str, fl
     return evaluate_batches(model, predictor, tokenizer, sampler, args, device)
 
 
-def build_model(args: TrainArgs) -> nn.Module:
+def build_model(args: TrainArgs, tokenizer: Any) -> nn.Module:
     if args.init == "pretrained":
         return AutoModel.from_pretrained(args.model_name)
+    if args.init == "unixcoder_small_scratch":
+        config = small_unixcoder_config(
+            vocab_size=len(tokenizer),
+            pad_token_id=tokenizer.pad_token_id,
+            bos_token_id=tokenizer.bos_token_id or tokenizer.cls_token_id,
+            eos_token_id=tokenizer.eos_token_id or tokenizer.sep_token_id,
+            max_position_embeddings=args.max_len + 2,
+        )
+        return SmallUniXcoder(config)
     config = AutoConfig.from_pretrained(args.model_name)
     if args.init == "roberta_large_scratch":
         if getattr(config, "model_type", "") != "roberta":
-            raise ValueError("--init roberta_large_scratch requires a RoBERTa/CodeBERT-style config")
+            raise ValueError(
+                "--init roberta_large_scratch requires a RoBERTa/CodeBERT-style config"
+            )
         config.hidden_size = 1024
         config.num_hidden_layers = 24
         config.num_attention_heads = 16
@@ -431,8 +522,14 @@ def model_from_checkpoint(checkpoint: dict[str, Any], fallback_model_name: str) 
     config_dict = checkpoint.get("model_config")
     if config_dict:
         model_type = config_dict.get("model_type")
-        config = AutoConfig.for_model(model_type) if model_type else AutoConfig.from_pretrained(fallback_model_name)
+        config = (
+            AutoConfig.for_model(model_type)
+            if model_type
+            else AutoConfig.from_pretrained(fallback_model_name)
+        )
         config.update(config_dict)
+        if checkpoint.get("model_class") == "SmallUniXcoder":
+            return SmallUniXcoder(config)
         return AutoModel.from_config(config)
     return AutoModel.from_pretrained(fallback_model_name)
 
@@ -445,14 +542,31 @@ def encode(model: nn.Module, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
     return pooled.float()
 
 
-def tokenize(tokenizer: Any, texts: list[str], max_len: int, device: torch.device) -> dict[str, torch.Tensor]:
-    batch = tokenizer(
-        texts,
-        padding=True,
-        truncation=True,
-        max_length=max_len,
-        return_tensors="pt",
-    )
+def tokenize(
+    tokenizer: Any,
+    texts: list[str],
+    max_len: int,
+    device: torch.device,
+    *,
+    unixcoder_mode: bool = False,
+) -> dict[str, torch.Tensor]:
+    if unixcoder_mode:
+        batch = unixcoder_tokenize(
+            tokenizer,
+            texts,
+            mode=ENCODER_ONLY,
+            padding="longest",
+            max_length=max_len,
+            return_tensors="pt",
+        )
+    else:
+        batch = tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=max_len,
+            return_tensors="pt",
+        )
     return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
 
 
@@ -462,6 +576,7 @@ def save_light_checkpoint(
     payload = {
         "step": step,
         "model_name": args.model_name,
+        "model_class": model_class_name(ctx),
         "model_config": ctx.config.to_dict() if hasattr(ctx, "config") else {},
         "ctx_model": {k: v.detach().cpu() for k, v in ctx.state_dict().items()},
         "predictor": {k: v.detach().cpu() for k, v in predictor.state_dict().items()},
@@ -471,7 +586,7 @@ def save_light_checkpoint(
     latest = out / "latest.pt"
     torch.save(payload, tmp)
     tmp.replace(latest)
-    if step % (args.save_every * 5) == 0:
+    if args.save_every > 0 and step % (args.save_every * 5) == 0:
         shutil.copy2(latest, out / f"checkpoint-step-{step:08d}.pt")
 
 
@@ -484,6 +599,43 @@ def make_optimizer(params: list[nn.Parameter], args: TrainArgs) -> torch.optim.O
     return AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
 
+def model_class_name(model: nn.Module) -> str:
+    if isinstance(model, SmallUniXcoder):
+        return "SmallUniXcoder"
+    return type(model).__name__
+
+
+def load_tokenizer(model_name_or_path: str) -> Any:
+    try:
+        return AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
+    except Exception:
+        path = Path(model_name_or_path)
+        vocab_file = path / "vocab.json"
+        merges_file = path / "merges.txt"
+        if not vocab_file.exists() or not merges_file.exists():
+            raise
+        return RobertaTokenizerFast(
+            vocab_file=str(vocab_file),
+            merges_file=str(merges_file),
+            bos_token="<bos>",
+            eos_token="<eos>",
+            unk_token="<unk>",
+            pad_token="<pad>",
+            add_prefix_space=False,
+            model_max_length=512,
+        )
+
+
+def validate_small_unixcoder_size(parameter_count: int, tokenizer: Any) -> None:
+    if 25_000_000 <= parameter_count <= 30_000_000:
+        return
+    raise ValueError(
+        "--init unixcoder_small_scratch is intended for the 25-30M small tier, "
+        f"but this tokenizer gives {parameter_count:,} parameters with vocab size "
+        f"{len(tokenizer):,}. Use the Code-JEPA 16k BPE tokenizer via --model-name."
+    )
+
+
 def discover_shards(data_roots: list[Path], *, max_shards: int | None) -> list[ShardPair]:
     pairs: list[ShardPair] = []
     for root in data_roots:
@@ -493,13 +645,14 @@ def discover_shards(data_roots: list[Path], *, max_shards: int | None) -> list[S
             raise FileNotFoundError(f"missing triples dir: {triples_dir}")
         if not views_dir.exists():
             raise FileNotFoundError(f"missing views dir: {views_dir}")
-        for triples_path in sorted(triples_dir.glob("*.parquet")):
-            views_path = views_dir / triples_path.name
+        for triples_path in sorted(triples_dir.rglob("*.parquet")):
+            rel = triples_path.relative_to(triples_dir)
+            views_path = views_dir / rel
             if views_path.exists():
                 pairs.append(
                     ShardPair(
                         root=str(root),
-                        name=f"{root.name}/{triples_path.name}",
+                        name=f"{root.name}/{rel.as_posix()}",
                         views_path=str(views_path),
                         triples_path=str(triples_path),
                     )
