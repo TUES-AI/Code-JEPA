@@ -90,7 +90,7 @@ class SmallUniXcoder(nn.Module):
         super().__init__()
         self.config = config or small_unixcoder_config()
         self.config.is_decoder = True
-        self.encoder = RobertaModel(self.config)
+        self.encoder = RobertaModel(self.config, attn_implementation="eager")
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.lm_head.weight = self.encoder.embeddings.word_embeddings.weight
         self.register_buffer(
