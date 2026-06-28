@@ -29,14 +29,22 @@ pip install -e . --no-deps -q
 python - <<'PY'
 import torch
 print("torch", torch.__version__, "| cuda", torch.cuda.is_available(), "| gpus", torch.cuda.device_count())
+if torch.cuda.device_count() < 2:
+    raise RuntimeError("Expected 2 GPUs, got " + str(torch.cuda.device_count()))
+for i in range(torch.cuda.device_count()):
+    print(f"  GPU {i}:", torch.cuda.get_device_name(i))
 PY
 
+# control -> GPU 0, code_jepa -> GPU 1, both run in parallel
 ASSET_ROOT=/valhalla/projects/bg-eng-01/scratch/vvasilev/code-jepa-small \
 OUTPUT_ROOT=runs/equal-small-unixcoder-pretrain \
 STEPS=200000 \
 BATCH_SIZE=128 \
 MAX_LEN=256 \
 PRECISION=bf16 \
+PARALLEL=1 \
+CONTROL_GPU=0 \
+JEPA_GPU=1 \
 bash scripts/run_equal_pretraining.sh
 
 echo "Equal pretrain done. Checkpoints:"
