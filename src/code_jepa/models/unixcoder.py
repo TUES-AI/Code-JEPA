@@ -78,8 +78,8 @@ def small_unixcoder_config(
         attention_probs_dropout_prob=float(values["attention_probs_dropout_prob"]),
         initializer_range=float(values["initializer_range"]),
         layer_norm_eps=float(values["layer_norm_eps"]),
-        is_decoder=True,
-        use_cache=True,
+        is_decoder=False,
+        use_cache=False,
     )
 
 
@@ -89,8 +89,11 @@ class SmallUniXcoder(nn.Module):
     def __init__(self, config: RobertaConfig | None = None) -> None:
         super().__init__()
         self.config = config or small_unixcoder_config()
-        self.config.is_decoder = True
-        self.encoder = RobertaModel(self.config, attn_implementation="eager")
+        # is_decoder=False: we build all attention masks manually in
+        # _model_attention_mask and pass them in; letting transformers regenerate
+        # a causal mask internally (is_decoder=True) breaks on transformers >=5.x.
+        self.config.is_decoder = False
+        self.encoder = RobertaModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.lm_head.weight = self.encoder.embeddings.word_embeddings.weight
         self.register_buffer(
@@ -151,25 +154,16 @@ class SmallUniXcoder(nn.Module):
     ) -> torch.Tensor:
         if mode not in UNIXCODER_MODE_TOKENS:
             raise ValueError(f"unknown UniXcoder mode: {mode}")
-        if attention_mask is not None and attention_mask.dim() == 3:
-            return attention_mask
 
         valid = (
             attention_mask
             if attention_mask is not None
             else input_ids.ne(self.config.pad_token_id)
         )
-        valid = valid.to(dtype=torch.bool, device=input_ids.device)
-        if mode == DECODER_ONLY:
-            seq_len = input_ids.size(-1)
-            if seq_len > self.causal_bias.size(-1):
-                raise ValueError(
-                    f"sequence length {seq_len} exceeds max_position_embeddings "
-                    f"{self.causal_bias.size(-1)}"
-                )
-            causal = self.causal_bias[:, :seq_len, :seq_len].to(input_ids.device)
-            return causal & valid[:, None, :]
-        return valid[:, None, :] & valid[:, :, None]
+        # Return a plain 2D (batch, seq) mask. Transformers >=5.x builds the
+        # full attention bias internally from a 2D mask; passing 3D/4D masks
+        # no longer works across versions.
+        return valid.to(dtype=torch.long, device=input_ids.device)
 
 
 def ensure_unixcoder_special_tokens(tokenizer: PreTrainedTokenizerBase) -> int:
