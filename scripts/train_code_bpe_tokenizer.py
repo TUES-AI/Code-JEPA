@@ -103,7 +103,12 @@ def main() -> None:
 def discover_unit_shards(roots: list[Path]) -> list[Path]:
     shards: list[Path] = []
     for root in roots:
-        shards.extend(sorted((root.expanduser() / "units").glob("*.parquet")))
+        root = root.expanduser()
+        direct = root / "units"
+        if direct.exists():
+            shards.extend(sorted(direct.glob("*.parquet")))
+            continue
+        shards.extend(sorted(root.rglob("units/*.parquet")))
     return shards
 
 

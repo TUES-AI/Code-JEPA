@@ -17,9 +17,15 @@ Archived proof-of-learning prep scripts live in `scripts/archive/old_data_prep/`
   manifest.json
   segments/
     <dataset>/
-      transform-v0/
-      transform-v1/
-      transform-v2/
+      <language>/
+        transform-v0/
+          core/
+        transform-v1/
+          core/
+          only-<transform>/
+        transform-v2/
+          core/
+          only-<transform>/
       task-semantic/
 ```
 
@@ -31,7 +37,7 @@ files, units, spans, views, triples, relations, semantic_pairs
 
 Transform stage names are only transformation-family names. They are not data-pipeline versions. Prepared `transform-v*` segments are deltas, not cumulative copies. Training recipes are cumulative by selecting multiple segments together, e.g. `v0 + v1 + v2`.
 
-Each delta segment may keep prior-stage support views to form triplets, but it only writes training triples involving at least one transform from that segment's own stage.
+Each delta segment may keep prior-stage support views to form triplets, but it only writes training triples involving at least one transform from that segment's own stage. Parent stage manifests make the layout appendable: later transform families can be added under `only-<transform>/` without rerunning the core segment.
 
 ## Training families
 
@@ -46,7 +52,8 @@ Each delta segment may keep prior-stage support views to form triplets, but it o
 Code datasets:
 
 ```text
-codesearchnet_python
+codesearchnet          # full six-language CodeSearchNet: python, java, javascript, go, php, ruby
+codesearchnet_python   # legacy Python-only alias
 codeparrot_clean_python
 ```
 
@@ -67,7 +74,8 @@ For persistent local cache warming:
 PYTHONPATH=src python scripts/prepare_data.py \
   --output-dir /tmp/code-jepa-cache-warm \
   --download-only \
-  --datasets codesearchnet_python codeparrot_clean_python \
+  --datasets codesearchnet codeparrot_clean_python \
+  --languages all \
   --task-datasets humaneval mbpp apps codecontests
 ```
 
@@ -100,11 +108,12 @@ The default `--max-positive-views` is `16` so stage-local hard positives have ro
 ```bash
 PYTHONPATH=src python scripts/prepare_data.py \
   --output-dir /tmp/code-jepa-prep-smoke \
-  --datasets codesearchnet_python \
+  --datasets codesearchnet \
+  --languages all \
   --task-datasets humaneval mbpp \
   --transform-stages v2 \
   --splits train \
-  --max-examples-per-dataset 10 \
+  --max-examples-per-language 10 \
   --streaming \
   --shard-size 100
 ```

@@ -304,13 +304,13 @@ Current empirical note: on v0 synthetic triples, base CodeBERT mean-pool is weak
 
 ## Data sources
 
-Start Python-first.
+Start with full six-language CodeSearchNet for function-level multilingual pipeline validation: Python, Java, JavaScript, Go, PHP, and Ruby.
 
 Practical order:
 
-1. CodeSearchNet Python for function-level pipeline validation.
+1. Full CodeSearchNet for function/method-level synthetic transform training and cross-language sanity checks.
 2. CodeParrot clean Python as the public non-gated whole-file fallback when The Stack / StarCoderData auth is unavailable.
-3. Larger permissive whole-file Python corpus from The Stack / StarCoderData / similar once license filtering and storage are decided.
+3. Larger permissive whole-file corpora from The Stack / StarCoderData / similar once license filtering and storage are decided.
 4. Task/reference corpora for real semantic positives and cross-language retrieval: HumanEval, MBPP, APPS, CodeContests, CodeNet-like multi-solution datasets if accessible.
 
 Split by repository/source/task, never by transformed view. A unit and all derived views must remain in the same split. Task datasets should emit accepted-solution semantic pairs when multiple correct implementations or multiple languages exist for the same problem.

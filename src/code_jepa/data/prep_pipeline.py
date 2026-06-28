@@ -16,7 +16,7 @@ import textwrap
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from itertools import combinations, islice
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -28,14 +28,17 @@ from tqdm import tqdm
 
 from code_jepa.data.ids import stable_hash
 from code_jepa.data.python_ast import ParseResult, ast_spans, line_count, loc_bucket, parse_and_compile, rough_token_len
-from code_jepa.transforms.python_ast import (
+from code_jepa.languages.base import (
+    CODESEARCHNET_LANGUAGES,
     TRANSFORM_STAGES,
     TransformResult,
-    hard_negative_views_for_stage,
-    positive_views_for_stage,
+    canonical_inventory_jsonable,
+    stage_chain,
+    validate_adapter_coverage,
 )
+from code_jepa.languages.registry import adapter_for_language, expand_languages
 
-CODE_DATASETS = ("codesearchnet_python", "codeparrot_clean_python")
+CODE_DATASETS = ("codesearchnet", "codesearchnet_python", "codeparrot_clean_python")
 TASK_DATASETS = ("humaneval", "mbpp", "apps", "codecontests")
 ALL_DATASETS = CODE_DATASETS + TASK_DATASETS
 DEFAULT_TABLES = ("files", "units", "spans", "views", "triples", "relations", "semantic_pairs")
@@ -48,9 +51,15 @@ class PipelineConfig:
     transform_stages: list[str]
     task_datasets: list[str]
     splits: list[str]
+    languages: list[str] = field(default_factory=lambda: ["python"])
     max_examples_per_dataset: int | None = None
+    max_examples_per_language: int | None = None
     max_files_per_dataset: int | None = None
     dataset_max_files: tuple[str, ...] = ()
+    no_transforms: bool = False
+    strict_transform_coverage: bool = False
+    only_transform: str = ""
+    scan_until_yield: int = 0
     max_units_per_file: int = 96
     max_spans_per_unit: int = 128
     max_positive_views: int = 16
@@ -114,14 +123,19 @@ class SegmentWriter:
         dataset_key: str,
         segment_name: str,
         cfg: PipelineConfig,
+        language: str = "",
+        transform_stage: str = "",
     ) -> None:
         self.root = root
         self.dataset_key = dataset_key
         self.segment_name = segment_name
         self.cfg = cfg
+        self.language = language
+        self.transform_stage = transform_stage
         self.buffers: dict[str, list[dict[str, Any]]] = {table: [] for table in DEFAULT_TABLES}
         self.shard_index: defaultdict[str, int] = defaultdict(int)
         self.counts: Counter[str] = Counter()
+        self.transform_counts: Counter[str] = Counter()
         self.root.mkdir(parents=True, exist_ok=True)
 
     def add(self, table: str, records: list[dict[str, Any]] | dict[str, Any]) -> None:
@@ -129,6 +143,7 @@ class SegmentWriter:
             records = [records]
         if not records:
             return
+        self._observe_records(table, records)
         self.buffers[table].extend(records)
         self.counts[table] += len(records)
         if len(self.buffers[table]) >= self.cfg.shard_size:
@@ -137,6 +152,25 @@ class SegmentWriter:
     def add_many(self, records: dict[str, list[dict[str, Any]]]) -> None:
         for table, rows in records.items():
             self.add(table, rows)
+
+    def _observe_records(self, table: str, records: list[dict[str, Any]]) -> None:
+        if table == "units":
+            for record in records:
+                if record.get("unit_family") != "span_window":
+                    self.transform_counts["source_units"] += 1
+        elif table == "views":
+            for record in records:
+                if record.get("family") != "focal_triplet" or record.get("role") not in {"positive", "negative"}:
+                    continue
+                role = str(record.get("role"))
+                name = str(record.get("transform_name"))
+                prefix = f"{role}:{name}"
+                self.transform_counts[f"yielded:{prefix}"] += 1
+                if record.get("parse_ok"):
+                    self.transform_counts[f"parse_valid:{prefix}"] += 1
+                changed = str(record.get("changed_spans_json") or "[]")
+                if changed and changed != "[]":
+                    self.transform_counts[f"changed_span:{prefix}"] += 1
 
     def flush_table(self, table: str) -> None:
         records = self.buffers[table]
@@ -150,6 +184,31 @@ class SegmentWriter:
         self.buffers[table] = []
         self.shard_index[table] += 1
 
+    def transform_matrix(self) -> list[dict[str, Any]]:
+        if not self.transform_stage or self.transform_stage == "extract-only":
+            return []
+        attempted = int(self.transform_counts.get("source_units", 0))
+        rows: list[dict[str, Any]] = []
+        for stage in stage_chain(self.transform_stage):
+            for role, names in canonical_inventory_jsonable()[stage].items():
+                for name in names:
+                    if self.cfg.only_transform and name != self.cfg.only_transform:
+                        continue
+                    prefix = f"{role}:{name}"
+                    rows.append(
+                        {
+                            "language": self.language,
+                            "stage": stage,
+                            "role": role,
+                            "transform": name,
+                            "attempted": attempted,
+                            "yielded": int(self.transform_counts.get(f"yielded:{prefix}", 0)),
+                            "parse_valid_after_transform": int(self.transform_counts.get(f"parse_valid:{prefix}", 0)),
+                            "changed_span_present": int(self.transform_counts.get(f"changed_span:{prefix}", 0)),
+                        }
+                    )
+        return rows
+
     def close(self) -> None:
         for table in DEFAULT_TABLES:
             self.flush_table(table)
@@ -157,10 +216,16 @@ class SegmentWriter:
             "format": "code-jepa-canonical-prep-segment",
             "created_at_unix": time.time(),
             "dataset_key": self.dataset_key,
+            "language": self.language,
             "segment_name": self.segment_name,
+            "transform_stage": self.transform_stage,
             "tokenizer_agnostic": True,
+            "appendable": True,
+            "append_subsegment_role": "core" if not self.cfg.only_transform else f"only-{self.cfg.only_transform}",
+            "canonical_transform_inventory": canonical_inventory_jsonable(),
             "tables": list(DEFAULT_TABLES),
             "counts": dict(self.counts),
+            "transform_matrix": self.transform_matrix(),
             "config": asdict(self.cfg),
         }
         atomic_write_json(self.root / "manifest.json", manifest)
@@ -173,9 +238,15 @@ def parse_args() -> PipelineConfig:
     p.add_argument("--transform-stages", nargs="+", default=list(TRANSFORM_STAGES))
     p.add_argument("--task-datasets", nargs="*", default=["humaneval", "mbpp"])
     p.add_argument("--splits", nargs="+", default=["train", "validation", "test"])
+    p.add_argument("--languages", nargs="*", default=["python"], help="CodeSearchNet languages, or 'all'.")
     p.add_argument("--max-examples-per-dataset", type=int, default=None)
+    p.add_argument("--max-examples-per-language", type=int, default=None)
     p.add_argument("--max-files-per-dataset", type=int, default=None)
     p.add_argument("--dataset-max-files", nargs="*", default=())
+    p.add_argument("--no-transforms", action="store_true")
+    p.add_argument("--strict-transform-coverage", action="store_true")
+    p.add_argument("--only-transform", default="")
+    p.add_argument("--scan-until-yield", type=int, default=0)
     p.add_argument("--max-units-per-file", type=int, default=96)
     p.add_argument("--max-spans-per-unit", type=int, default=128)
     p.add_argument("--max-positive-views", type=int, default=16)
@@ -213,14 +284,27 @@ def validate_config(cfg: PipelineConfig) -> None:
     unknown_stages = sorted(set(cfg.transform_stages) - set(TRANSFORM_STAGES))
     if unknown_stages:
         raise ValueError(f"unknown transform stages {unknown_stages}; expected subset of {TRANSFORM_STAGES}")
+    languages = expand_languages(cfg.languages)
+    if cfg.strict_transform_coverage or "codesearchnet" in cfg.datasets:
+        validate_adapter_coverage([adapter_for_language(language) for language in languages], cfg.transform_stages)
     for entry in cfg.dataset_max_files:
         if "=" not in entry:
             raise ValueError("--dataset-max-files entries must be dataset=N")
         dataset, value = entry.split("=", 1)
-        if dataset not in CODE_DATASETS:
-            raise ValueError(f"unknown --dataset-max-files dataset {dataset!r}")
+        if dataset not in CODE_DATASETS and dataset not in CODESEARCHNET_LANGUAGES:
+            raise ValueError(f"unknown --dataset-max-files dataset/language {dataset!r}")
         if int(value) < 1:
             raise ValueError("--dataset-max-files values must be >= 1")
+    if cfg.only_transform:
+        exists = any(
+            cfg.only_transform in names
+            for stage in canonical_inventory_jsonable().values()
+            for names in stage.values()
+        )
+        if not exists:
+            raise ValueError(f"unknown --only-transform {cfg.only_transform!r}")
+    if cfg.scan_until_yield < 0:
+        raise ValueError("--scan-until-yield must be >= 0")
     if cfg.num_workers < 0:
         raise ValueError("--num-workers must be >= 0")
     if cfg.worker_chunksize < 1:
@@ -251,21 +335,50 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         "tokenizer_agnostic": True,
         "code_datasets": cfg.datasets,
         "task_datasets": cfg.task_datasets,
+        "languages": expand_languages(cfg.languages) if "codesearchnet" in cfg.datasets else cfg.languages,
         "transform_stages": cfg.transform_stages,
+        "canonical_transform_inventory": canonical_inventory_jsonable(),
         "segments": [],
         "config": asdict(cfg),
     }
     write_pipeline_manifest(out, pipeline_manifest)
 
     for dataset_key in cfg.datasets:
-        for stage in cfg.transform_stages:
+        if dataset_key == "codesearchnet":
+            for language in expand_languages(cfg.languages):
+                stages = ["extract-only"] if cfg.no_transforms else cfg.transform_stages
+                for stage in stages:
+                    segment_parent = out / "segments" / dataset_key / language / f"transform-{stage}"
+                    subsegment = "core" if not cfg.only_transform else f"only-{cfg.only_transform}"
+                    segment_root = segment_parent / subsegment
+                    if prepare_segment_root(out, segment_root, cfg.resume):
+                        pipeline_manifest["segments"].append(str(segment_root.relative_to(out)))
+                        write_parent_segment_manifest(segment_parent, segment_root, language, stage, cfg)
+                        write_pipeline_manifest(out, pipeline_manifest)
+                        continue
+                    writer = SegmentWriter(
+                        segment_root,
+                        dataset_key=dataset_key,
+                        segment_name=f"transform-{stage}/{subsegment}",
+                        cfg=cfg,
+                        language=language,
+                        transform_stage=stage,
+                    )
+                    prepare_code_dataset_segment(dataset_key, stage, cfg, writer, language=language)
+                    writer.close()
+                    write_parent_segment_manifest(segment_parent, segment_root, language, stage, cfg)
+                    pipeline_manifest["segments"].append(str(segment_root.relative_to(out)))
+                    write_pipeline_manifest(out, pipeline_manifest)
+            continue
+        for stage in (["extract-only"] if cfg.no_transforms else cfg.transform_stages):
             segment_root = out / "segments" / dataset_key / f"transform-{stage}"
             if prepare_segment_root(out, segment_root, cfg.resume):
                 pipeline_manifest["segments"].append(str(segment_root.relative_to(out)))
                 write_pipeline_manifest(out, pipeline_manifest)
                 continue
-            writer = SegmentWriter(segment_root, dataset_key=dataset_key, segment_name=f"transform-{stage}", cfg=cfg)
-            prepare_code_dataset_segment(dataset_key, stage, cfg, writer)
+            language = "python" if dataset_key in {"codesearchnet_python", "codeparrot_clean_python"} else ""
+            writer = SegmentWriter(segment_root, dataset_key=dataset_key, segment_name=f"transform-{stage}", cfg=cfg, language=language, transform_stage=stage)
+            prepare_code_dataset_segment(dataset_key, stage, cfg, writer, language=language)
             writer.close()
             pipeline_manifest["segments"].append(str(segment_root.relative_to(out)))
             write_pipeline_manifest(out, pipeline_manifest)
@@ -290,6 +403,32 @@ def write_pipeline_manifest(out: Path, manifest: dict[str, Any]) -> None:
     atomic_write_json(out / "manifest.json", manifest)
 
 
+def write_parent_segment_manifest(parent: Path, child: Path, language: str, stage: str, cfg: PipelineConfig) -> None:
+    existing_children = []
+    path = parent / "manifest.json"
+    if path.exists():
+        try:
+            existing_children = json.loads(path.read_text()).get("subsegments", [])
+        except json.JSONDecodeError:
+            existing_children = []
+    rel = str(child.relative_to(parent))
+    children = sorted({*existing_children, rel})
+    atomic_write_json(
+        path,
+        {
+            "format": "code-jepa-transform-stage-parent-v1",
+            "created_at_unix": time.time(),
+            "language": language,
+            "transform_stage": stage,
+            "appendable": True,
+            "append_rule": "new transform families can be materialized as additional subsegments under this transform-stage directory",
+            "subsegments": children,
+            "canonical_transform_inventory": canonical_inventory_jsonable(),
+            "config": asdict(cfg),
+        },
+    )
+
+
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
@@ -310,6 +449,11 @@ def prepare_segment_root(out: Path, segment_root: Path, resume: bool) -> bool:
 def download_to_hf_cache(cfg: PipelineConfig) -> None:
     warm_cfg = PipelineConfig(**{**asdict(cfg), "streaming": False})
     for dataset_key in [*cfg.datasets, *cfg.task_datasets]:
+        if dataset_key == "codesearchnet":
+            for language in expand_languages(cfg.languages):
+                for args in dataset_load_args(dataset_key, cfg.splits, language=language):
+                    load_dataset_safe(args, warm_cfg)
+            continue
         for args in dataset_load_args(dataset_key, cfg.splits):
             load_dataset_safe(args, warm_cfg)
 
@@ -319,9 +463,11 @@ def prepare_code_dataset_segment(
     transform_stage: str,
     cfg: PipelineConfig,
     writer: SegmentWriter,
+    *,
+    language: str = "",
 ) -> None:
-    rows = iter_source_files(dataset_key, cfg)
-    total = dataset_file_limit(dataset_key, cfg) or cfg.max_examples_per_dataset
+    rows = iter_source_files(dataset_key, cfg, language=language)
+    total = dataset_file_limit(language or dataset_key, cfg) or dataset_file_limit(dataset_key, cfg) or cfg.max_examples_per_language or cfg.max_examples_per_dataset
     desc = f"{dataset_key}/{transform_stage}"
     if cfg.num_workers > 1:
         with ProcessPoolExecutor(max_workers=cfg.num_workers) as pool:
@@ -372,9 +518,16 @@ def bounded_process_map(pool: ProcessPoolExecutor, fn: Any, jobs: Iterable[Any],
         return pool.map(fn, jobs, chunksize=cfg.worker_chunksize)
 
 
-def dataset_load_args(dataset_key: str, splits: list[str]) -> list[dict[str, Any]]:
+def dataset_load_args(dataset_key: str, splits: list[str], language: str = "") -> list[dict[str, Any]]:
     if dataset_key == "codeparrot_clean_python":
         return [{"path": "codeparrot/codeparrot-clean", "split": "train"}]
+    if dataset_key == "codesearchnet":
+        if not language:
+            raise ValueError("codesearchnet requires a language")
+        return [
+            {"path": "code_search_net", "name": language, "split": split}
+            for split in select_splits(splits, ["train", "validation", "test"])
+        ]
     if dataset_key == "codesearchnet_python":
         return [
             {"path": "code_search_net", "name": "python", "split": split}
@@ -419,27 +572,39 @@ def load_dataset_safe(args: dict[str, Any], cfg: PipelineConfig):
     return load_dataset(**kwargs)
 
 
-def iter_source_files(dataset_key: str, cfg: PipelineConfig) -> Iterator[SourceFile]:
+def iter_source_files(dataset_key: str, cfg: PipelineConfig, *, language: str = "") -> Iterator[SourceFile]:
     produced = 0
-    file_limit = dataset_file_limit(dataset_key, cfg)
-    for args in dataset_load_args(dataset_key, cfg.splits):
+    file_limit = dataset_file_limit(language or dataset_key, cfg) or dataset_file_limit(dataset_key, cfg)
+    row_limit = cfg.max_examples_per_language if dataset_key == "codesearchnet" else cfg.max_examples_per_dataset
+    if row_limit is None:
+        row_limit = cfg.max_examples_per_dataset
+    yielded_with_transforms = 0
+    for args in dataset_load_args(dataset_key, cfg.splits, language=language):
         dataset = load_dataset_safe(args, cfg)
         split_name = str(args["split"])
         iterator: Iterable[dict[str, Any]] = dataset
-        row_limit = cfg.max_examples_per_dataset
-        if row_limit is not None:
+        if row_limit is not None and not cfg.scan_until_yield:
             remaining = row_limit - produced
             if remaining <= 0:
                 return
             iterator = islice(iterator, remaining)
         for row_index, row in enumerate(iterator):
-            source = source_file_from_row(dataset_key, split_name, row_index, row)
+            source = source_file_from_row(dataset_key, split_name, row_index, row, language=language)
             if source is None:
                 continue
             produced += 1
             yield source
             if file_limit is not None and produced >= file_limit:
                 return
+            if cfg.scan_until_yield and cfg.only_transform:
+                records = records_from_source_file(source, cfg.transform_stages[-1], cfg)
+                yielded_with_transforms += sum(
+                    1
+                    for view in records.get("views", [])
+                    if view.get("transform_name") == cfg.only_transform and view.get("family") == "focal_triplet"
+                )
+                if yielded_with_transforms >= cfg.scan_until_yield:
+                    return
             if row_limit is not None and produced >= row_limit:
                 return
 
@@ -453,7 +618,7 @@ def dataset_file_limit(dataset_key: str, cfg: PipelineConfig) -> int | None:
 
 
 def source_file_from_row(
-    dataset_key: str, source_split: str, row_index: int, row: dict[str, Any]
+    dataset_key: str, source_split: str, row_index: int, row: dict[str, Any], *, language: str = ""
 ) -> SourceFile | None:
     if dataset_key == "codeparrot_clean_python":
         source = row.get("content") or ""
@@ -469,21 +634,23 @@ def source_file_from_row(
         }
         return SourceFile(dataset_key, "codeparrot/codeparrot-clean", source_split, row_index, repo, path, "python", source, metadata)
 
-    if dataset_key == "codesearchnet_python":
+    if dataset_key in {"codesearchnet", "codesearchnet_python"}:
+        row_language = language or ("python" if dataset_key == "codesearchnet_python" else str(row.get("language") or ""))
         code = row.get("whole_func_string") or row.get("func_code_string") or ""
         if not isinstance(code, str) or not code.strip():
             return None
         repo = str(row.get("repository_name") or "")
-        path = str(row.get("func_path_in_repository") or f"row-{row_index}.py")
+        path = str(row.get("func_path_in_repository") or f"row-{row_index}.{row_language}")
         func_name = str(row.get("func_name") or f"function_{row_index}")
         source = code.rstrip() + "\n"
         metadata = {
             "func_name": func_name,
             "func_code_url": row.get("func_code_url"),
             "documentation": row.get("func_documentation_string"),
+            "split_name": row.get("split_name"),
             "note": "CodeSearchNet provides function strings, not whole files.",
         }
-        return SourceFile(dataset_key, "code_search_net/python", source_split, row_index, repo, path, "python", source, metadata)
+        return SourceFile(dataset_key, f"code_search_net/{row_language}", source_split, row_index, repo, path, row_language, source, metadata)
 
     raise ValueError(dataset_key)
 
@@ -508,15 +675,20 @@ def _records_from_source_file(
     source = source_file.source.rstrip() + "\n"
     if source_file.metadata.get("autogenerated") is True or str(source_file.metadata.get("autogenerated", "")).lower() == "true":
         return records
-    parsed = parse_and_compile(source)
-    if parsed.tree is None or not parsed.parse_ok:
+    adapter = adapter_for_language(source_file.language)
+    if source_file.language == "python":
+        python_parse = parse_and_compile(source)
+        parsed = adapter.parse(source) if python_parse.parse_ok else python_parse
+    else:
+        parsed = adapter.parse(source)
+    if not parsed.parse_ok:
         return records
 
     file_hash = str(source_file.metadata.get("hash") or stable_hash([source_file.repository_name, source_file.path, source]))
     file_id = stable_hash([source_file.dataset_key, source_file.repository_name, source_file.path, file_hash])
     repo_split = repo_hash_split(source_file.repository_name or source_file.path or file_id)
-    imports_context = imports_from_tree(parsed.tree, source)
-    top_defs = top_defs_from_tree(parsed.tree)
+    imports_context = getattr(adapter, "imports_context", lambda code: "")(source)
+    top_defs = top_defs_from_tree(parsed.tree) if source_file.language == "python" and parsed.tree is not None else []
     file_record = {
         "file_id": file_id,
         "dataset_key": source_file.dataset_key,
@@ -540,12 +712,37 @@ def _records_from_source_file(
     }
     records["files"].append(file_record)
 
-    units = extract_python_units(file_id, parsed.tree, source, imports_context, cfg)
-    for unit in units:
+    language_units = adapter.extract_units(file_id, source, cfg)
+    for language_unit in language_units:
+        unit_id = stable_hash([
+            file_id,
+            source_file.language,
+            language_unit.unit_family,
+            language_unit.qualified_name,
+            language_unit.start_line,
+            language_unit.end_line,
+            language_unit.code,
+        ])
+        unit = CodeUnit(
+            unit_id=unit_id,
+            file_id=file_id,
+            unit_family=language_unit.unit_family,
+            unit_type=language_unit.unit_type,
+            qualified_name=language_unit.qualified_name,
+            code=language_unit.code,
+            start_line=language_unit.start_line,
+            end_line=language_unit.end_line,
+            imports_context=language_unit.imports_context or imports_context,
+            class_context=language_unit.class_context,
+            sibling_signatures=language_unit.sibling_signatures,
+            identifiers=language_unit.identifiers,
+            calls=language_unit.calls,
+            ast_sequence=language_unit.ast_sequence,
+        )
         unit_loc = line_count(unit.code)
         if unit.unit_family in {"function", "method", "nested_function"} and (unit_loc < cfg.min_loc or unit_loc > cfg.max_loc):
             continue
-        unit_parse = parse_and_compile(unit.code) if unit.unit_family != "file_window" else parsed
+        unit_parse = adapter.parse(unit.code) if unit.unit_family != "file_window" else parsed
         unit_record = unit_to_record(unit, source_file, repo_split, transform_stage, unit_parse)
         records["units"].append(unit_record)
         records["relations"].append(
@@ -558,9 +755,10 @@ def _records_from_source_file(
                 "metadata_json": json.dumps({"unit_family": unit.unit_family}, sort_keys=True),
             }
         )
-        unit_spans = ast_spans(unit.unit_id, unit.code)[: cfg.max_spans_per_unit]
+        unit_spans = adapter.spans(unit.unit_id, unit.code, cfg.max_spans_per_unit)
         records["spans"].extend({**span, "file_id": file_id, "split": repo_split} for span in unit_spans)
-        build_views_and_triples(unit, source_file, repo_split, transform_stage, cfg, records)
+        if not cfg.no_transforms and transform_stage != "extract-only":
+            build_views_and_triples(unit, source_file, repo_split, transform_stage, cfg, records)
     return records
 
 
@@ -613,12 +811,16 @@ def positive_support_views_for_segment(
     stage: str,
     *,
     max_views: int,
+    language: str,
+    only_transform: str = "",
 ) -> tuple[list[TransformResult], set[str]]:
+    adapter = adapter_for_language(language)
     return support_views_for_segment(
         code,
         stage,
         max_views=max_views,
-        getter=positive_views_for_stage,
+        getter=adapter.positive_views_for_stage,
+        only_transform=only_transform,
     )
 
 
@@ -627,12 +829,16 @@ def negative_support_views_for_segment(
     stage: str,
     *,
     max_views: int,
+    language: str,
+    only_transform: str = "",
 ) -> tuple[list[TransformResult], set[str]]:
+    adapter = adapter_for_language(language)
     return support_views_for_segment(
         code,
         stage,
         max_views=max_views,
-        getter=hard_negative_views_for_stage,
+        getter=adapter.negative_views_for_stage,
+        only_transform=only_transform,
     )
 
 
@@ -642,30 +848,21 @@ def support_views_for_segment(
     *,
     max_views: int,
     getter: Any,
+    only_transform: str,
 ) -> tuple[list[TransformResult], set[str]]:
     support: list[TransformResult] = []
     delta_names: set[str] = set()
     seen = {code.strip()}
     for item in stage_chain(stage):
-        for view in getter(code, item, max_views=max_views):
+        for view in getter(code, item, max_views=max_views, only_transform=""):
             normalized = view.code.strip()
             if normalized in seen:
                 continue
             seen.add(normalized)
             support.append(view)
-            if item == stage:
+            if item == stage and (not only_transform or view.name == only_transform):
                 delta_names.add(view.name)
     return support, delta_names
-
-
-def stage_chain(stage: str) -> list[str]:
-    if stage == "v0":
-        return ["v0"]
-    if stage == "v1":
-        return ["v0", "v1"]
-    if stage == "v2":
-        return ["v0", "v1", "v2"]
-    raise ValueError(f"unknown transform stage {stage!r}")
 
 
 def build_views_and_triples(
@@ -680,17 +877,23 @@ def build_views_and_triples(
         unit.code,
         transform_stage,
         max_views=cfg.max_positive_views,
+        language=source_file.language,
+        only_transform=cfg.only_transform,
     )
     negatives, negative_delta_names = negative_support_views_for_segment(
         unit.code,
         transform_stage,
         max_views=cfg.max_negative_views,
+        language=source_file.language,
+        only_transform=cfg.only_transform,
     )
     if not positives or not negatives:
         return
+    if cfg.only_transform and not positive_delta_names and not negative_delta_names:
+        return
 
     focal_anchor = make_view(unit, source_file, split, transform_stage, "focal_triplet", "anchor", "anchor", unit.code, "safe", [], {})
-    context_anchor_code = contextualize(unit.code, unit)
+    context_anchor_code = contextualize(unit.code, unit, source_file.language)
     context_anchor = make_view(
         unit,
         source_file,
@@ -712,7 +915,7 @@ def build_views_and_triples(
         "ast_aux",
         "auxiliary",
         "ast_sequence",
-        "# <ast>\n# " + " ".join(unit.ast_sequence) + "\n",
+        comment_text("<ast>\n" + " ".join(unit.ast_sequence), source_file.language),
         "safe",
         [],
         {"auxiliary_type": "ast_node_type_sequence"},
@@ -750,7 +953,7 @@ def build_views_and_triples(
                     split,
                     transform_stage,
                     "context_triplet",
-                    replace_code(transform, contextualize(transform.code, unit), "positive_context"),
+                    replace_code(transform, contextualize(transform.code, unit, source_file.language), "positive_context"),
                 ),
             )
         )
@@ -764,7 +967,7 @@ def build_views_and_triples(
                     split,
                     transform_stage,
                     "context_triplet",
-                    replace_code(transform, contextualize(transform.code, unit), "negative_context"),
+                    replace_code(transform, contextualize(transform.code, unit, source_file.language), "negative_context"),
                 ),
             )
         )
@@ -843,7 +1046,7 @@ def make_view(
     changed_spans: list[dict[str, Any]],
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
-    parsed = parse_and_compile(code)
+    parsed = parse_code_for_language(code, source_file.language)
     view_id = stable_hash([unit.unit_id, family, role, transform_name, code])
     return {
         "view_id": view_id,
@@ -922,6 +1125,7 @@ def build_local_span_triples(
             negative_code = line_window(negative.code, start_line, end_line, cfg.local_window_radius)
             if not anchor_code.strip() or not negative_code.strip():
                 continue
+            adapter = adapter_for_language(source_file.language)
             span_unit = CodeUnit(
                 unit_id=stable_hash([unit.unit_id, "span_window", negative.name, start_line, end_line]),
                 file_id=unit.file_id,
@@ -934,11 +1138,11 @@ def build_local_span_triples(
                 imports_context="",
                 class_context="",
                 sibling_signatures="",
-                identifiers=identifiers_from_code(anchor_code),
-                calls=calls_from_code(anchor_code),
-                ast_sequence=ast_sequence_from_code(anchor_code),
+                identifiers=adapter.identifiers_from_code(anchor_code),
+                calls=adapter.calls_from_code(anchor_code),
+                ast_sequence=adapter.ast_sequence_from_code(anchor_code),
             )
-            span_record = unit_to_record(span_unit, source_file, split, transform_stage, parse_and_compile(anchor_code))
+            span_record = unit_to_record(span_unit, source_file, split, transform_stage, adapter.parse(anchor_code))
             records["units"].append(span_record)
             anchor_view = make_view(span_unit, source_file, split, transform_stage, "local_span_triplet", "anchor", "span_anchor", anchor_code, "safe", [], {"parent_unit_id": unit.unit_id})
             positive_view = make_view(span_unit, source_file, split, transform_stage, "local_span_triplet", "positive", "span_positive", positive_code, "likely", [], {"parent_unit_id": unit.unit_id})
@@ -960,16 +1164,21 @@ def build_local_span_triples(
             )
 
 
-def contextualize(focal_code: str, unit: CodeUnit) -> str:
+def contextualize(focal_code: str, unit: CodeUnit, language: str) -> str:
     sections = []
     if unit.imports_context.strip():
-        sections.append("# <imports>\n" + unit.imports_context.strip())
+        sections.append(comment_text("<imports>", language) + unit.imports_context.strip())
     if unit.class_context.strip():
-        sections.append("# <class>\n# " + unit.class_context.strip().replace("\n", "\n# "))
+        sections.append(comment_text("<class>\n" + unit.class_context.strip(), language))
     if unit.sibling_signatures.strip():
-        sections.append("# <siblings>\n# " + unit.sibling_signatures.strip().replace("\n", "\n# "))
-    sections.append("# <focal>\n" + focal_code.rstrip())
+        sections.append(comment_text("<siblings>\n" + unit.sibling_signatures.strip(), language))
+    sections.append(comment_text("<focal>", language) + focal_code.rstrip())
     return "\n\n".join(sections) + "\n"
+
+
+def comment_text(text: str, language: str) -> str:
+    prefix = "#" if language in {"python", "ruby"} else "//"
+    return "\n".join(f"{prefix} {line}" if line else prefix for line in text.splitlines()) + "\n"
 
 
 def sampling_weight(unit: CodeUnit, family: str) -> float:
@@ -1353,6 +1562,7 @@ def _records_from_task(task: dict[str, Any], dataset_key: str, cfg: PipelineConf
     for solution in unique_solutions(task["solutions"], max_solutions=cfg.max_task_solutions_per_task):
         code = str(solution["code"]).rstrip() + "\n"
         language = normalize_language(solution.get("language", "python"))
+        adapter = adapter_for_language(language) if language in CODESEARCHNET_LANGUAGES else None
         parsed = parse_code_for_language(code, language)
         unit_id = stable_hash([dataset_key, task_id, solution.get("solution_id"), language, code])
         unit = CodeUnit(
@@ -1367,9 +1577,9 @@ def _records_from_task(task: dict[str, Any], dataset_key: str, cfg: PipelineConf
             imports_context="",
             class_context="",
             sibling_signatures="",
-            identifiers=identifiers_from_tree(parsed.tree) if parsed.tree is not None else [],
-            calls=calls_from_tree(parsed.tree) if parsed.tree is not None else [],
-            ast_sequence=ast_sequence_from_tree(parsed.tree) if parsed.tree is not None else [],
+            identifiers=adapter.identifiers_from_code(code) if adapter is not None else [],
+            calls=adapter.calls_from_code(code) if adapter is not None else [],
+            ast_sequence=adapter.ast_sequence_from_code(code) if adapter is not None else [],
         )
         source_file = SourceFile(dataset_key, dataset_key, str(task.get("split") or ""), -1, dataset_key, f"{task_id}.task", language, code, {"task_id": task_id})
         records["units"].append(unit_to_record(unit, source_file, split, "task-semantic", parsed))
@@ -1446,10 +1656,10 @@ def normalize_language(value: Any) -> str:
     return aliases.get(text, text)
 
 
-def parse_code_for_language(code: str, language: str) -> ParseResult:
-    if language == "python":
-        return parse_and_compile(code)
-    return ParseResult(None, False, False, f"parse_skipped_non_python:{language}")
+def parse_code_for_language(code: str, language: str) -> Any:
+    if language in CODESEARCHNET_LANGUAGES:
+        return adapter_for_language(language).parse(code)
+    return ParseResult(None, False, False, f"parse_skipped_unsupported_language:{language}")
 
 
 def parse_json_maybe(value: Any) -> Any:
