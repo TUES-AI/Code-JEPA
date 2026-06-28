@@ -23,8 +23,10 @@ from typing import Any
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from transformers import AutoConfig, AutoModel, AutoTokenizer, RobertaTokenizerFast
 from transformers import get_cosine_schedule_with_warmup
@@ -43,6 +45,34 @@ from code_jepa.models import (
     small_unixcoder_config,
     unixcoder_tokenize,
 )
+
+import os as _os
+
+
+def _setup_distributed() -> tuple[int, int, int]:
+    """Init NCCL process group when running under torchrun. Returns (local_rank, rank, world_size)."""
+    if "LOCAL_RANK" not in _os.environ:
+        return 0, 0, 1
+    local_rank = int(_os.environ["LOCAL_RANK"])
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(local_rank)
+    return local_rank, dist.get_rank(), dist.get_world_size()
+
+
+def _is_dist() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _rank() -> int:
+    return dist.get_rank() if _is_dist() else 0
+
+
+def _world() -> int:
+    return dist.get_world_size() if _is_dist() else 1
+
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DDP) else model
 
 
 @dataclass(frozen=True)
@@ -210,8 +240,9 @@ def parse_args() -> TrainArgs:
 
 
 def main() -> None:
+    local_rank, rank, world_size = _setup_distributed()
     args = parse_args()
-    set_seed(args.seed)
+    set_seed(args.seed + rank)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     try:
@@ -220,40 +251,48 @@ def main() -> None:
         pass
 
     out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(
-        json.dumps(asdict(args), indent=2, sort_keys=True) + "\n"
-    )
+    if rank == 0:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "config.json").write_text(
+            json.dumps(asdict(args), indent=2, sort_keys=True) + "\n"
+        )
+    if _is_dist():
+        dist.barrier()
 
     data_roots = [Path(root) for root in args.data_roots]
     pairs = discover_shards(data_roots, max_shards=args.max_shards)
-    log(out, {"event": "loading_views", "data_roots": args.data_roots})
+    if rank == 0:
+        log(out, {"event": "loading_views", "data_roots": args.data_roots})
     view_by_id = load_all_views(data_roots)
-    log(
-        out,
-        {
-            "event": "startup",
-            "pairs": len(pairs),
-            "views_loaded": len(view_by_id),
-            "args": asdict(args),
-            "device": device_name(),
-        },
-    )
+    if rank == 0:
+        log(
+            out,
+            {
+                "event": "startup",
+                "pairs": len(pairs),
+                "views_loaded": len(view_by_id),
+                "world_size": world_size,
+                "args": asdict(args),
+                "device": device_name(),
+            },
+        )
 
     if args.eval_only:
-        metrics = evaluate_checkpoint(args, pairs, view_by_id)
-        log(out, {"event": "eval_only", **metrics})
+        if rank == 0:
+            metrics = evaluate_checkpoint(args, pairs, view_by_id)
+            log(out, {"event": "eval_only", **metrics})
         return
 
-    train(args, pairs, view_by_id, out)
+    train(args, pairs, view_by_id, out, local_rank=local_rank)
 
 
-def train(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str], out: Path) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str], out: Path, *, local_rank: int = 0) -> None:
+    rank = _rank()
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     tokenizer = load_tokenizer(args.model_name)
     if args.init == "unixcoder_small_scratch":
         added = ensure_unixcoder_special_tokens(tokenizer)
-        if added:
+        if added and rank == 0:
             log(out, {"event": "tokenizer_added_unixcoder_tokens", "count": added})
     ctx = build_model(args, tokenizer).to(device)
     hidden_size = int(ctx.config.hidden_size)
@@ -262,36 +301,44 @@ def train(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str], o
     parameter_count = count_parameters(ctx)
     if args.init == "unixcoder_small_scratch":
         validate_small_unixcoder_size(parameter_count, tokenizer)
-    log(
-        out,
-        {
-            "event": "model_built",
-            "model_class": model_class_name(ctx),
-            "unique_parameters": parameter_count,
-            "hidden_size": hidden_size,
-        },
-    )
+    if rank == 0:
+        log(
+            out,
+            {
+                "event": "model_built",
+                "model_class": model_class_name(ctx),
+                "unique_parameters": parameter_count,
+                "hidden_size": hidden_size,
+            },
+        )
 
     if args.gradient_checkpointing and hasattr(ctx, "gradient_checkpointing_enable"):
         ctx.gradient_checkpointing_enable()
+
+    if _is_dist():
+        ctx = DDP(ctx, device_ids=[local_rank], find_unused_parameters=False)
+        predictor = DDP(predictor, device_ids=[local_rank], find_unused_parameters=False)
+
     if args.compile:
         predictor = torch.compile(predictor)  # type: ignore[assignment]
 
-    optimizer = make_optimizer(list(ctx.parameters()) + list(predictor.parameters()), args)
+    optimizer = make_optimizer(list(_unwrap(ctx).parameters()) + list(_unwrap(predictor).parameters()), args)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup_steps,
         num_training_steps=args.steps,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and args.precision == "fp16"))
-    sampler = ShardSampler(pairs, view_by_id, seed=args.seed)
-    eval_sampler = ShardSampler(pairs, view_by_id, seed=args.seed + 17)
+    # Each rank uses a different seed so they sample different shards
+    sampler = ShardSampler(pairs, view_by_id, seed=args.seed + rank)
+    eval_sampler = ShardSampler(pairs, view_by_id, seed=args.seed + 17 + rank)
     started = time.time()
     deadline = started + args.duration_hours * 3600 if args.duration_hours > 0 else math.inf
 
     for step in range(1, args.steps + 1):
         if time.time() >= deadline:
-            log(out, {"event": "deadline", "step": step})
+            if rank == 0:
+                log(out, {"event": "deadline", "step": step})
             break
         batch_started = time.time()
         batch = sampler.next_batch(args.batch_size)
@@ -311,35 +358,40 @@ def train(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str], o
         step_s = time.time() - batch_started
         remaining_steps = args.steps - step
         eta_h = round(remaining_steps * (elapsed / step) / 3600, 2) if step > 0 else 0
-        metrics.update(
-            {
-                "event": "train",
-                "step": step,
-                "elapsed_s": round(elapsed, 2),
-                "batch_s": round(step_s, 3),
-                "eta_h": eta_h,
-                "lr": scheduler.get_last_lr()[0],
-                "shard": sampler.current.name if sampler.current else "",
-                "shard_load_s": round(sampler.last_load_s, 3),
-            }
-        )
-        if step == 1 or step % args.log_every == 0:
-            log(out, metrics)
+        if rank == 0:
+            metrics.update(
+                {
+                    "event": "train",
+                    "step": step,
+                    "elapsed_s": round(elapsed, 2),
+                    "batch_s": round(step_s, 3),
+                    "eta_h": eta_h,
+                    "lr": scheduler.get_last_lr()[0],
+                    "shard": sampler.current.name if sampler.current else "",
+                    "shard_load_s": round(sampler.last_load_s, 3),
+                }
+            )
+            if step == 1 or step % args.log_every == 0:
+                log(out, metrics)
         if args.dry_run_batches and step >= args.dry_run_batches:
-            log(out, {"event": "dry_run_done", "step": step})
+            if rank == 0:
+                log(out, {"event": "dry_run_done", "step": step})
             break
-        if args.eval_every > 0 and step % args.eval_every == 0:
-            eval_metrics = evaluate_batches(ctx, predictor, tokenizer, eval_sampler, args, device)
+        if args.eval_every > 0 and step % args.eval_every == 0 and rank == 0:
+            eval_metrics = evaluate_batches(_unwrap(ctx), _unwrap(predictor), tokenizer, eval_sampler, args, device)
             log(out, {"event": "eval", "step": step, **eval_metrics})
-        if args.save_every > 0 and step % args.save_every == 0:
-            save_light_checkpoint(out, ctx, predictor, args, step)
-        if args.s3_output_prefix and args.s3_sync_every > 0 and step % args.s3_sync_every == 0:
+        if args.save_every > 0 and step % args.save_every == 0 and rank == 0:
+            save_light_checkpoint(out, _unwrap(ctx), _unwrap(predictor), args, step)
+        if args.s3_output_prefix and args.s3_sync_every > 0 and step % args.s3_sync_every == 0 and rank == 0:
             sync_s3(out, args.s3_output_prefix)
 
-    save_light_checkpoint(out, ctx, predictor, args, step)
-    if args.s3_output_prefix:
-        sync_s3(out, args.s3_output_prefix)
-    log(out, {"event": "done", "step": step, "elapsed_s": round(time.time() - started, 2)})
+    if rank == 0:
+        save_light_checkpoint(out, _unwrap(ctx), _unwrap(predictor), args, step)
+        if args.s3_output_prefix:
+            sync_s3(out, args.s3_output_prefix)
+        log(out, {"event": "done", "step": step, "elapsed_s": round(time.time() - started, 2)})
+    if _is_dist():
+        dist.destroy_process_group()
 
 
 def train_step(

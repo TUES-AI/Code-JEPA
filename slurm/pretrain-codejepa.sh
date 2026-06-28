@@ -28,7 +28,7 @@ cd "${PROJECT_DIR}"
 mkdir -p logs
 pip install -e . --no-deps -q
 
-python scripts/train_codebert_jepa_torch.py \
+torchrun --nproc_per_node=2 --master_port=29501 scripts/train_codebert_jepa_torch.py \
     --data-roots "${DATA_ROOT}" \
     --model-name assets/tokenizers/codesearchnet-python/bpe16k \
     --init unixcoder_small_scratch \
