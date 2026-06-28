@@ -8,7 +8,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:h200:1
 #SBATCH -o /valhalla/projects/bg-eng-01/Code-JEPA/logs/smoke-pretrain.%j.out
 #SBATCH -e /valhalla/projects/bg-eng-01/Code-JEPA/logs/smoke-pretrain.%j.err
 
@@ -38,6 +38,9 @@ BATCH_SIZE=8 \
 MAX_LEN=128 \
 MAX_SHARDS=2 \
 PRECISION=bf16 \
+PARALLEL=0 \
+CONTROL_GPU=0 \
+JEPA_GPU=0 \
 bash scripts/run_equal_pretraining.sh
 
 echo "Smoke pretrain done. Outputs:"
