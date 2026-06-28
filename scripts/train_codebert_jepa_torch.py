@@ -67,9 +67,6 @@ def _rank() -> int:
     return dist.get_rank() if _is_dist() else 0
 
 
-def _world() -> int:
-    return dist.get_world_size() if _is_dist() else 1
-
 
 def _unwrap(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
@@ -312,12 +309,13 @@ def train(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str], o
             },
         )
 
-    if args.gradient_checkpointing and hasattr(ctx, "gradient_checkpointing_enable"):
+    # Gradient checkpointing is incompatible with static_graph DDP; skip it in distributed runs
+    if args.gradient_checkpointing and not _is_dist() and hasattr(ctx, "gradient_checkpointing_enable"):
         ctx.gradient_checkpointing_enable()
 
     if _is_dist():
-        ctx = DDP(ctx, device_ids=[local_rank], find_unused_parameters=False)
-        predictor = DDP(predictor, device_ids=[local_rank], find_unused_parameters=False)
+        ctx = DDP(ctx, device_ids=[local_rank], find_unused_parameters=False, static_graph=True)
+        predictor = DDP(predictor, device_ids=[local_rank], find_unused_parameters=False, static_graph=True)
 
     if args.compile:
         predictor = torch.compile(predictor)  # type: ignore[assignment]
