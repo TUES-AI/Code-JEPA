@@ -86,7 +86,6 @@ class TrainArgs:
 class ShardPair:
     root: str
     name: str
-    views_path: str
     triples_path: str
 
 
@@ -106,8 +105,15 @@ class Predictor(nn.Module):
 
 
 class ShardSampler:
-    def __init__(self, pairs: list[ShardPair], *, seed: int) -> None:
+    def __init__(
+        self,
+        pairs: list[ShardPair],
+        view_by_id: dict[str, str],
+        *,
+        seed: int,
+    ) -> None:
         self.pairs = pairs
+        self.view_by_id = view_by_id
         self.rng = random.Random(seed)
         self.examples: list[tuple[str, str, str]] = []
         self.index = 0
@@ -133,11 +139,6 @@ class ShardSampler:
     def _load_random_shard(self) -> None:
         started = time.time()
         pair = self.rng.choice(self.pairs)
-        view_table = pq.read_table(pair.views_path, columns=["view_id", "code"])
-        view_ids = view_table.column("view_id").to_pylist()
-        codes = view_table.column("code").to_pylist()
-        view_by_id = {view_id: code for view_id, code in zip(view_ids, codes) if view_id and code}
-
         triple_table = pq.read_table(
             pair.triples_path,
             columns=["anchor_view_id", "positive_view_id", "negative_view_id"],
@@ -148,9 +149,9 @@ class ShardSampler:
 
         examples: list[tuple[str, str, str]] = []
         for anchor_id, positive_id, negative_id in zip(anchor_ids, positive_ids, negative_ids):
-            anchor = view_by_id.get(anchor_id)
-            positive = view_by_id.get(positive_id)
-            negative = view_by_id.get(negative_id)
+            anchor = self.view_by_id.get(anchor_id)
+            positive = self.view_by_id.get(positive_id)
+            negative = self.view_by_id.get(negative_id)
             if anchor and positive and negative:
                 examples.append((anchor, positive, negative))
         if not examples:
@@ -224,24 +225,30 @@ def main() -> None:
         json.dumps(asdict(args), indent=2, sort_keys=True) + "\n"
     )
 
-    pairs = discover_shards(
-        [Path(root) for root in args.data_roots],
-        max_shards=args.max_shards,
-    )
+    data_roots = [Path(root) for root in args.data_roots]
+    pairs = discover_shards(data_roots, max_shards=args.max_shards)
+    log(out, {"event": "loading_views", "data_roots": args.data_roots})
+    view_by_id = load_all_views(data_roots)
     log(
         out,
-        {"event": "startup", "pairs": len(pairs), "args": asdict(args), "device": device_name()},
+        {
+            "event": "startup",
+            "pairs": len(pairs),
+            "views_loaded": len(view_by_id),
+            "args": asdict(args),
+            "device": device_name(),
+        },
     )
 
     if args.eval_only:
-        metrics = evaluate_checkpoint(args, pairs)
+        metrics = evaluate_checkpoint(args, pairs, view_by_id)
         log(out, {"event": "eval_only", **metrics})
         return
 
-    train(args, pairs, out)
+    train(args, pairs, view_by_id, out)
 
 
-def train(args: TrainArgs, pairs: list[ShardPair], out: Path) -> None:
+def train(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str], out: Path) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = load_tokenizer(args.model_name)
     if args.init == "unixcoder_small_scratch":
@@ -277,8 +284,8 @@ def train(args: TrainArgs, pairs: list[ShardPair], out: Path) -> None:
         num_training_steps=args.steps,
     )
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and args.precision == "fp16"))
-    sampler = ShardSampler(pairs, seed=args.seed)
-    eval_sampler = ShardSampler(pairs, seed=args.seed + 17)
+    sampler = ShardSampler(pairs, view_by_id, seed=args.seed)
+    eval_sampler = ShardSampler(pairs, view_by_id, seed=args.seed + 17)
     started = time.time()
     deadline = started + args.duration_hours * 3600 if args.duration_hours > 0 else math.inf
 
@@ -475,7 +482,7 @@ def evaluate_batches(
     }
 
 
-def evaluate_checkpoint(args: TrainArgs, pairs: list[ShardPair]) -> dict[str, float]:
+def evaluate_checkpoint(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str]) -> dict[str, float]:
     if not args.checkpoint:
         raise ValueError("--eval-only requires --checkpoint")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -492,7 +499,7 @@ def evaluate_checkpoint(args: TrainArgs, pairs: list[ShardPair]) -> dict[str, fl
     predictor = Predictor(hidden_size, args.dropout).to(device)
     model.load_state_dict(checkpoint["ctx_model"])
     predictor.load_state_dict(checkpoint["predictor"])
-    sampler = ShardSampler(pairs, seed=args.seed + 101)
+    sampler = ShardSampler(pairs, view_by_id, seed=args.seed + 101)
     return evaluate_batches(model, predictor, tokenizer, sampler, args, device)
 
 
@@ -641,29 +648,46 @@ def validate_small_unixcoder_size(parameter_count: int, tokenizer: Any) -> None:
     )
 
 
+def load_all_views(data_roots: list[Path]) -> dict[str, str]:
+    """Load all views from all data roots into a global view_id -> code mapping.
+
+    Views are ~2 GB on disk across all stages and must be loaded globally because
+    triples shards reference view IDs from across all views shards — same-numbered
+    shard pairing does not hold.
+    """
+    view_by_id: dict[str, str] = {}
+    for root in data_roots:
+        views_dir = root / "views"
+        if not views_dir.exists():
+            raise FileNotFoundError(f"missing views dir: {views_dir}")
+        for views_path in sorted(views_dir.rglob("*.parquet")):
+            table = pq.read_table(str(views_path), columns=["view_id", "code"])
+            for view_id, code in zip(
+                table.column("view_id").to_pylist(),
+                table.column("code").to_pylist(),
+            ):
+                if view_id and code:
+                    view_by_id[view_id] = code
+    return view_by_id
+
+
 def discover_shards(data_roots: list[Path], *, max_shards: int | None) -> list[ShardPair]:
     pairs: list[ShardPair] = []
     for root in data_roots:
         triples_dir = root / "triples"
-        views_dir = root / "views"
         if not triples_dir.exists():
             raise FileNotFoundError(f"missing triples dir: {triples_dir}")
-        if not views_dir.exists():
-            raise FileNotFoundError(f"missing views dir: {views_dir}")
         for triples_path in sorted(triples_dir.rglob("*.parquet")):
             rel = triples_path.relative_to(triples_dir)
-            views_path = views_dir / rel
-            if views_path.exists():
-                pairs.append(
-                    ShardPair(
-                        root=str(root),
-                        name=f"{root.name}/{rel.as_posix()}",
-                        views_path=str(views_path),
-                        triples_path=str(triples_path),
-                    )
+            pairs.append(
+                ShardPair(
+                    root=str(root),
+                    name=f"{root.name}/{rel.as_posix()}",
+                    triples_path=str(triples_path),
                 )
+            )
     if not pairs:
-        raise FileNotFoundError(f"no matched views/triples shards under {data_roots}")
+        raise FileNotFoundError(f"no triples shards under {data_roots}")
     if max_shards is not None:
         pairs = pairs[:max_shards]
     return pairs
