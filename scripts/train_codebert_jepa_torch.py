@@ -314,8 +314,8 @@ def train(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str], o
         ctx.gradient_checkpointing_enable()
 
     if _is_dist():
-        ctx = DDP(ctx, device_ids=[local_rank], find_unused_parameters=False, static_graph=True)
-        predictor = DDP(predictor, device_ids=[local_rank], find_unused_parameters=False, static_graph=True)
+        ctx = DDP(ctx, device_ids=[local_rank], find_unused_parameters=True)
+        predictor = DDP(predictor, device_ids=[local_rank], find_unused_parameters=True)
 
     if args.compile:
         predictor = torch.compile(predictor)  # type: ignore[assignment]
