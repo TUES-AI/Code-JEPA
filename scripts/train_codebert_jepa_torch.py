@@ -276,7 +276,7 @@ def train(args: TrainArgs, pairs: list[ShardPair], out: Path) -> None:
         num_warmup_steps=args.warmup_steps,
         num_training_steps=args.steps,
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and args.precision == "fp16"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and args.precision == "fp16"))
     sampler = ShardSampler(pairs, seed=args.seed)
     eval_sampler = ShardSampler(pairs, seed=args.seed + 17)
     started = time.time()
@@ -300,12 +300,17 @@ def train(args: TrainArgs, pairs: list[ShardPair], out: Path) -> None:
             args,
             device,
         )
+        elapsed = time.time() - started
+        step_s = time.time() - batch_started
+        remaining_steps = args.steps - step
+        eta_h = round(remaining_steps * (elapsed / step) / 3600, 2) if step > 0 else 0
         metrics.update(
             {
                 "event": "train",
                 "step": step,
-                "elapsed_s": round(time.time() - started, 2),
-                "batch_s": round(time.time() - batch_started, 3),
+                "elapsed_s": round(elapsed, 2),
+                "batch_s": round(step_s, 3),
+                "eta_h": eta_h,
                 "lr": scheduler.get_last_lr()[0],
                 "shard": sampler.current.name if sampler.current else "",
                 "shard_load_s": round(sampler.last_load_s, 3),
