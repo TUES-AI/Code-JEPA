@@ -86,13 +86,14 @@ Whole files are the canonical source and context. Functions/methods are the main
 Recommended records:
 
 - `files`: repo/path/license/source/imports/top-level defs/parse status;
-- `units`: function/method/class/span with parent file, byte range, line range, context;
+- `units`: function/method/nested function/class summary/file window/span window/task solution with parent file, line range, context, identifiers, calls, and AST node-type sequence;
 - `spans`: AST node spans and changed spans;
-- `views`: anchor/positive/negative transformed code;
-- `relations`: file contains unit, class contains method, unit uses import, function calls function;
-- `triples`: anchor-positive-negative training relations with per-head labels.
+- `views`: anchor/positive/negative/context/local-span/task-solution transformed code;
+- `relations`: file contains unit, class contains method, unit has AST auxiliary view, unit uses import, function calls function;
+- `triples`: anchor-positive-negative training relations with per-head labels;
+- `semantic_pairs`: same-task accepted-solution pairs, including same-language different implementations and cross-language solutions.
 
-Use Parquet + zstd shards for processed data. Keep raw code, byte spans, AST spans, transform metadata, and rough length buckets. Do not tokenize until the model/backbone tokenizer is chosen.
+The canonical data-prep pipeline is tokenizer-agnostic and writes reproducible Parquet + zstd segments by dataset and transformation stage. Keep raw code, spans, context, AST side channels, transform metadata, rough length buckets, repo/task split, and sampling weights. Do not tokenize until the model/backbone tokenizer is chosen.
 
 ## Code block sizes
 
@@ -120,9 +121,12 @@ Positive views should preserve behavior with high confidence:
 - comment/docstring removal or rewriting when safe;
 - trivial import split/merge/reorder when no side-effect risk;
 - equivalent syntax rewrites only under conservative rules;
+- conservative control-flow rewrites such as boolean-return simplification and if-return conditional expressions;
+- guarded independent-statement reordering;
+- guarded refactor-like rewrites such as simple loop-to-comprehension, range-for-to-while, and accumulator-to-`sum` rewrites;
 - alternate structural views: AST, DFG, CFG, call graph, dependency graph, call-site context.
 
-Riskier positives such as statement reordering, algebraic rewrites, top-level definition reordering, import style normalization, type annotation changes, and function extraction/inlining should be delayed or marked with confidence flags.
+Riskier positives such as broad statement reordering, algebraic rewrites, top-level definition reordering, import style normalization, type annotation changes, and function extraction/inlining should be delayed or marked with confidence flags.
 
 ### Hard negatives
 
@@ -141,11 +145,13 @@ Hard negatives are compile-valid behavior-impacting mutations relative to the or
 
 Always record changed byte/AST spans. The local head depends on this metadata.
 
-### Dataset transform versions
+### Dataset transform stages
+
+These names describe transformation families only, not data-pipeline versions. The canonical prep pipeline emits each stage as a separate reproducible delta segment to avoid duplicating training triples when the whole dataset is processed. Training recipes are cumulative by selecting multiple segments, e.g. `v0 + v1 + v2`.
 
 - `v0`: first conservative synthetic set. Positives: AST normalization, docstring removal, local variable/argument renaming. Negatives: comparison flip, boolean-op flip, call-argument swap, wrong variable, small integer flip.
-- `v1`: harder-negative augmentation over prepared units. Positives are regenerated as in `v0`; negatives add membership/identity flip, condition negation, arithmetic-op flip, subscript-index flip, default-value flip, sort reverse flip, return-value removal, and await removal.
-- `v2`: not defined yet. Reserve this name for the next materially different transform family, not for more shards of `v0`/`v1`.
+- `v1`: delta over `v0`. Positives: independent assignment reorder, boolean-return simplification, if-return to conditional expression, unreachable-else removal, and same-block import sorting. Negatives: membership/identity flip, condition negation, arithmetic-op flip, subscript-index flip, default-value flip, sort reverse flip, return-value removal, and await removal.
+- `v2`: delta over `v1`. Positives: simple range-for to while-loop, list-append loop to comprehension, accumulator loop to `sum`, De Morgan boolean rewrite, and broader independent statement reorder. Negatives: loop-bound off-by-one, missing guard/edge-case branch, wrong exception type, dropped keyword argument, copy-vs-alias mutation, and dropped context manager/resource handling.
 
 ## Per-head training labels
 
@@ -305,9 +311,9 @@ Practical order:
 1. CodeSearchNet Python for function-level pipeline validation.
 2. CodeParrot clean Python as the public non-gated whole-file fallback when The Stack / StarCoderData auth is unavailable.
 3. Larger permissive whole-file Python corpus from The Stack / StarCoderData / similar once license filtering and storage are decided.
-4. Task/reference corpora for reranking and semantic positives: HumanEval, MBPP, APPS, CodeContests, CodeNet-like multi-solution datasets if accessible.
+4. Task/reference corpora for real semantic positives and cross-language retrieval: HumanEval, MBPP, APPS, CodeContests, CodeNet-like multi-solution datasets if accessible.
 
-Split by repository/source/task, never by transformed view. A unit and all derived views must remain in the same split.
+Split by repository/source/task, never by transformed view. A unit and all derived views must remain in the same split. Task datasets should emit accepted-solution semantic pairs when multiple correct implementations or multiple languages exist for the same problem.
 
 ## Risks and settled constraints
 

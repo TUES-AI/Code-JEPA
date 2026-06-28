@@ -75,8 +75,23 @@ def node_span(node: ast.AST, code: str, *, max_source_chars: int = 240) -> dict[
         "start_col": start_col,
         "end_line": end_line,
         "end_col": end_col,
+        "start_byte": byte_offset(code, start_line, start_col),
+        "end_byte": byte_offset(code, end_line, end_col),
         "source": segment,
     }
+
+
+def byte_offset(code: str, line: int, col: int) -> int:
+    """Return absolute UTF-8 byte offset for Python AST line/column coordinates."""
+
+    if line <= 1:
+        return max(0, col)
+    total = 0
+    for current_line, text in enumerate(code.splitlines(keepends=True), start=1):
+        if current_line >= line:
+            return total + max(0, col)
+        total += len(text.encode("utf-8"))
+    return total + max(0, col)
 
 
 def ast_spans(unit_id: str, code: str, *, max_source_chars: int = 240) -> list[dict[str, Any]]:

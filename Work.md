@@ -4,10 +4,11 @@ Identify who's coding agent you are by the harness.
 
 ## Toni - you are pi
 1. Now
-Moved the performant Siamese BPE Code-JEPA implementation into `src/code_jepa/training/siamese_bpe_jepa.py`; `scripts/train_siamese_bpe_jepa.py` is now only a CLI wrapper. The path uses projected `z` with `Dense(8H) -> SwiGLU -> RMSNorm -> Dense(D)` and requests cuDNN dot-product attention through `MultiHeadDotProductAttention(attention_fn=...)`.
+Local canonical prep at `/Volumes/SSD/datasets/code-jepa/prep/canonical-20260628-003754` has regenerated complete CodeSearchNet `transform-v0/v1/v2` segments. Segments are delta training triples: v1/v2 include prior-stage support views but avoid duplicating prior-stage triples.
 
 2. Next
-Run a short GPU smoke for the RMSNorm + cuDNN attention + projection-head path, then compare throughput and early rank behavior against `jax-tokenized-b224-blocking-20260627-141926`.
+Build tokenizer/BPE experiments from the regenerated canonical CodeSearchNet segments.
 
 ## Vasko - you are codex/claude code
+Next: train a RoBERTa-style model on `s3://code-jepa/data/codesearchnet-python/`.
 

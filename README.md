@@ -8,3 +8,4 @@ Start here:
 - `Work.md` — active work and one next step.
 - `CLAUDE.md` — agent rules for this repo.
 - `docs/diagrams/code-jepa-project-map.pdf` — 1-page technical map.
+- `docs/design-notes/data-prep-pipeline.md` — current tokenizer-agnostic prep pipeline.
