@@ -19,8 +19,10 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +35,27 @@ if str(ROOT) not in sys.path:
 from code_jepa.models import ENCODER_ONLY, SmallUniXcoder, ensure_unixcoder_special_tokens
 from code_jepa.models import unixcoder_tokenize
 from scripts.train_codebert_jepa_torch import load_tokenizer, model_from_checkpoint
+
+
+def _setup_distributed() -> tuple[int, int, int]:
+    if "LOCAL_RANK" not in os.environ:
+        return 0, 0, 1
+    local_rank = int(os.environ["LOCAL_RANK"])
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(local_rank)
+    return local_rank, dist.get_rank(), dist.get_world_size()
+
+
+def _is_dist() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _rank() -> int:
+    return dist.get_rank() if _is_dist() else 0
+
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DDP) else model
 
 
 @dataclass(frozen=True)
@@ -107,13 +130,18 @@ def parse_args() -> FineTuneArgs:
 
 
 def main() -> None:
+    local_rank, rank, world_size = _setup_distributed()
     args = parse_args()
-    set_seed(args.seed)
-    out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(json.dumps(asdict(args), indent=2, sort_keys=True) + "\n")
+    set_seed(args.seed + rank)
 
-    device = choose_device(args.device)
+    out = Path(args.output_dir)
+    if rank == 0:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "config.json").write_text(json.dumps(asdict(args), indent=2, sort_keys=True) + "\n")
+    if _is_dist():
+        dist.barrier()
+
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     model_name = args.model_name or str(checkpoint.get("model_name") or "")
     if not model_name:
@@ -124,24 +152,33 @@ def main() -> None:
     model = model_from_checkpoint(checkpoint, model_name).to(device)
     model.load_state_dict(checkpoint["ctx_model"])
 
-    log(
-        out,
-        {
-            "event": "startup",
-            "benchmark": args.benchmark,
-            "device": str(device),
-            "checkpoint_step": int(checkpoint.get("step", -1)),
-            "freeze_encoder": args.freeze_encoder,
-        },
-    )
+    if _is_dist():
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+
+    if rank == 0:
+        log(
+            out,
+            {
+                "event": "startup",
+                "benchmark": args.benchmark,
+                "device": str(device),
+                "world_size": world_size,
+                "checkpoint_step": int(checkpoint.get("step", -1)),
+                "freeze_encoder": args.freeze_encoder,
+            },
+        )
 
     if args.benchmark == "bigclonebench":
-        report = run_bigclonebench(args, model, tokenizer, device, out)
+        report = run_bigclonebench(args, model, tokenizer, device, out, rank=rank, world_size=world_size)
     else:
-        report = run_poj104(args, model, tokenizer, device, out)
+        report = run_poj104(args, model, tokenizer, device, out, rank=rank, world_size=world_size)
 
-    (out / "results.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    print(json.dumps(report, indent=2, sort_keys=True))
+    if rank == 0:
+        (out / "results.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        print(json.dumps(report, indent=2, sort_keys=True))
+
+    if _is_dist():
+        dist.destroy_process_group()
 
 
 def run_bigclonebench(
@@ -150,10 +187,13 @@ def run_bigclonebench(
     tokenizer: Any,
     device: torch.device,
     out: Path,
+    *,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> dict[str, Any]:
     base = Path(args.benchmark_dir)
     funcs = load_bigclonebench_functions(resolve_benchmark_file(base, "data.jsonl"))
-    train_pairs = load_bigclonebench_pairs(
+    all_train_pairs = load_bigclonebench_pairs(
         resolve_benchmark_file(base, "train.txt"),
         funcs,
         max_examples=args.max_train_examples,
@@ -172,8 +212,11 @@ def run_bigclonebench(
         seed=args.seed,
     )
 
-    head = PairClassifier(int(model.config.hidden_size), args.dropout).to(device)
-    optimizer = make_optimizer(args, model, head)
+    hidden_size = int(_unwrap(model).config.hidden_size)
+    head = PairClassifier(hidden_size, args.dropout).to(device)
+    if _is_dist():
+        head = DDP(head, device_ids=[device.index], find_unused_parameters=False)
+    optimizer = make_optimizer(args, _unwrap(model), _unwrap(head))
     scaler = make_grad_scaler(args, device)
     started = time.time()
     best_valid_f1 = -1.0
@@ -181,7 +224,9 @@ def run_bigclonebench(
 
     for epoch in range(1, args.epochs + 1):
         rng = random.Random(args.seed + epoch)
-        rng.shuffle(train_pairs)
+        rng.shuffle(all_train_pairs)
+        # Each rank processes its own shard of the training data
+        train_pairs = all_train_pairs[rank::world_size]
         train_metrics = train_bigclonebench_epoch(
             model,
             head,
@@ -193,35 +238,35 @@ def run_bigclonebench(
             device,
             out,
             epoch,
+            rank=rank,
         )
-        valid_metrics = evaluate_bigclonebench(model, head, tokenizer, valid_pairs, args, device)
-        if valid_metrics["best_f1"] > best_valid_f1:
-            best_valid_f1 = valid_metrics["best_f1"]
-            best_threshold = valid_metrics["best_threshold"]
-        log(
-            out,
-            {
-                "event": "epoch",
-                "epoch": epoch,
-                "elapsed_s": round(time.time() - started, 2),
-                **prefix_keys("train_", train_metrics),
-                **prefix_keys("valid_", valid_metrics),
-            },
-        )
+        if rank == 0:
+            valid_metrics = evaluate_bigclonebench(_unwrap(model), _unwrap(head), tokenizer, valid_pairs, args, device)
+            if valid_metrics["best_f1"] > best_valid_f1:
+                best_valid_f1 = valid_metrics["best_f1"]
+                best_threshold = valid_metrics["best_threshold"]
+            log(
+                out,
+                {
+                    "event": "epoch",
+                    "epoch": epoch,
+                    "elapsed_s": round(time.time() - started, 2),
+                    **prefix_keys("train_", train_metrics),
+                    **prefix_keys("valid_", valid_metrics),
+                },
+            )
+        if _is_dist():
+            dist.barrier()
 
-    test_metrics = evaluate_bigclonebench(
-        model,
-        head,
-        tokenizer,
-        test_pairs,
-        args,
-        device,
-        threshold=best_threshold,
-    )
-    save_finetuned(out, model, args, task_state={"pair_head": head.state_dict()})
+    test_metrics: dict[str, Any] = {}
+    if rank == 0:
+        test_metrics = evaluate_bigclonebench(
+            _unwrap(model), _unwrap(head), tokenizer, test_pairs, args, device, threshold=best_threshold,
+        )
+        save_finetuned(out, _unwrap(model), args, task_state={"pair_head": _unwrap(head).state_dict()})
     return {
         "benchmark": "bigclonebench",
-        "train_pairs": len(train_pairs),
+        "train_pairs": len(all_train_pairs),
         "valid_pairs": len(valid_pairs),
         "test_pairs": len(test_pairs),
         "best_valid_f1": best_valid_f1,
@@ -232,7 +277,7 @@ def run_bigclonebench(
 
 def train_bigclonebench_epoch(
     model: nn.Module,
-    head: PairClassifier,
+    head: nn.Module,
     tokenizer: Any,
     optimizer: torch.optim.Optimizer,
     scaler: torch.cuda.amp.GradScaler,
@@ -241,6 +286,8 @@ def train_bigclonebench_epoch(
     device: torch.device,
     out: Path,
     epoch: int,
+    *,
+    rank: int = 0,
 ) -> dict[str, float]:
     model.train(not args.freeze_encoder)
     head.train()
@@ -267,7 +314,7 @@ def train_bigclonebench_epoch(
         scaler.step(optimizer)
         scaler.update()
         losses.append(float(loss.detach().cpu()))
-        if step == 1 or step % args.log_every == 0:
+        if rank == 0 and (step == 1 or step % args.log_every == 0):
             log(out, {"event": "train_batch", "epoch": epoch, "step": step, "loss": losses[-1]})
     return {"loss": float(np.mean(losses)) if losses else 0.0}
 
@@ -303,12 +350,17 @@ def run_poj104(
     tokenizer: Any,
     device: torch.device,
     out: Path,
+    *,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> dict[str, Any]:
     base = Path(args.benchmark_dir)
-    train_rows = load_poj_rows(resolve_benchmark_file(base, "train.jsonl"), 0)
+    all_train_rows = load_poj_rows(resolve_benchmark_file(base, "train.jsonl"), 0)
     valid_rows = load_poj_rows(resolve_benchmark_file(base, "valid.jsonl"), args.max_valid_examples)
     test_rows = load_poj_rows(resolve_benchmark_file(base, "test.jsonl"), args.max_test_examples)
-    optimizer = make_optimizer(args, model, None)
+    # Each rank trains on its own shard (by label-preserving stride)
+    train_rows = all_train_rows[rank::world_size]
+    optimizer = make_optimizer(args, _unwrap(model), None)
     scaler = make_grad_scaler(args, device)
     started = time.time()
     best_valid_mapr = -1.0
@@ -324,25 +376,31 @@ def run_poj104(
             device,
             out,
             epoch,
+            rank=rank,
         )
-        valid_metrics = evaluate_poj_mapr(model, tokenizer, valid_rows, args, device)
-        best_valid_mapr = max(best_valid_mapr, valid_metrics["map_at_r"])
-        log(
-            out,
-            {
-                "event": "epoch",
-                "epoch": epoch,
-                "elapsed_s": round(time.time() - started, 2),
-                **prefix_keys("train_", train_metrics),
-                **prefix_keys("valid_", valid_metrics),
-            },
-        )
+        if rank == 0:
+            valid_metrics = evaluate_poj_mapr(_unwrap(model), tokenizer, valid_rows, args, device)
+            best_valid_mapr = max(best_valid_mapr, valid_metrics["map_at_r"])
+            log(
+                out,
+                {
+                    "event": "epoch",
+                    "epoch": epoch,
+                    "elapsed_s": round(time.time() - started, 2),
+                    **prefix_keys("train_", train_metrics),
+                    **prefix_keys("valid_", valid_metrics),
+                },
+            )
+        if _is_dist():
+            dist.barrier()
 
-    test_metrics = evaluate_poj_mapr(model, tokenizer, test_rows, args, device)
-    save_finetuned(out, model, args, task_state={})
+    test_metrics: dict[str, Any] = {}
+    if rank == 0:
+        test_metrics = evaluate_poj_mapr(_unwrap(model), tokenizer, test_rows, args, device)
+        save_finetuned(out, _unwrap(model), args, task_state={})
     return {
         "benchmark": "poj104",
-        "train_rows": len(train_rows),
+        "train_rows": len(all_train_rows),
         "valid_rows": len(valid_rows),
         "test_rows": len(test_rows),
         "best_valid_map_at_r": best_valid_mapr,
@@ -360,6 +418,8 @@ def train_poj_epoch(
     device: torch.device,
     out: Path,
     epoch: int,
+    *,
+    rank: int = 0,
 ) -> dict[str, float]:
     model.train(not args.freeze_encoder)
     sampler = PojTripletSampler(rows, seed=args.seed + epoch)
@@ -397,7 +457,7 @@ def train_poj_epoch(
         scaler.update()
         losses.append(float(loss.detach().cpu()))
         accuracies.append(float((sim_pos > sim_neg).float().mean().detach().cpu()))
-        if step == 1 or step % args.log_every == 0:
+        if rank == 0 and (step == 1 or step % args.log_every == 0):
             log(
                 out,
                 {
