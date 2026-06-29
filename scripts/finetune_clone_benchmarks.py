@@ -50,9 +50,6 @@ def _is_dist() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 
-def _rank() -> int:
-    return dist.get_rank() if _is_dist() else 0
-
 
 def _unwrap(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
@@ -344,6 +341,36 @@ def evaluate_bigclonebench(
     return binary_metrics(np.asarray(labels, dtype=np.int64), np.asarray(scores), threshold)
 
 
+def _load_poj_splits(args: FineTuneArgs) -> tuple[list[dict], list[dict], list[dict]]:
+    """Load POJ-104 splits from local jsonl files or HuggingFace if files are missing."""
+    base = Path(args.benchmark_dir)
+    local_train = base / "train.jsonl"
+    local_valid = base / "valid.jsonl"
+    local_test = base / "test.jsonl"
+
+    if local_train.exists() and local_valid.exists() and local_test.exists():
+        return (
+            load_poj_rows(local_train, 0),
+            load_poj_rows(local_valid, args.max_valid_examples),
+            load_poj_rows(local_test, args.max_test_examples),
+        )
+
+    from datasets import load_dataset  # type: ignore
+    ds = load_dataset("google/code_x_glue_cc_clone_detection_poj104")
+
+    def hf_to_rows(split: str, max_examples: int) -> list[dict]:
+        rows = [{"code": str(r["code"]), "label": str(r["label"])} for r in ds[split]]
+        if max_examples > 0:
+            rows = rows[:max_examples]
+        return rows
+
+    return (
+        hf_to_rows("train", 0),
+        hf_to_rows("validation", args.max_valid_examples),
+        hf_to_rows("test", args.max_test_examples),
+    )
+
+
 def run_poj104(
     args: FineTuneArgs,
     model: nn.Module,
@@ -354,10 +381,7 @@ def run_poj104(
     rank: int = 0,
     world_size: int = 1,
 ) -> dict[str, Any]:
-    base = Path(args.benchmark_dir)
-    all_train_rows = load_poj_rows(resolve_benchmark_file(base, "train.jsonl"), 0)
-    valid_rows = load_poj_rows(resolve_benchmark_file(base, "valid.jsonl"), args.max_valid_examples)
-    test_rows = load_poj_rows(resolve_benchmark_file(base, "test.jsonl"), args.max_test_examples)
+    all_train_rows, valid_rows, test_rows = _load_poj_splits(args)
     # Each rank trains on its own shard (by label-preserving stride)
     train_rows = all_train_rows[rank::world_size]
     optimizer = make_optimizer(args, _unwrap(model), None)
