@@ -1,0 +1,28 @@
+{
+  "actual_vocab_size": 16384,
+  "created_at_unix": 1782649807.2912378,
+  "format": "code-jepa-byte-bpe-tokenizer-v1",
+  "input_roots": [
+    "/Volumes/SSD/datasets/code-jepa/prep/canonical-20260628-003754/segments/codesearchnet_python/transform-v0"
+  ],
+  "input_shards": 83,
+  "input_table": "units.code",
+  "max_units": null,
+  "min_frequency": 2,
+  "model_max_length": 512,
+  "requested_vocab_size": 16384,
+  "sample_tokens": 15,
+  "special_ids": {
+    "bos": 1,
+    "eos": 2,
+    "pad": 0,
+    "unk": 3
+  },
+  "special_tokens": {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "pad_token": "<pad>",
+    "unk_token": "<unk>"
+  },
+  "trained_units": 1645002
+}

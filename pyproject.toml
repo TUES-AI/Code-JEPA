@@ -16,6 +16,7 @@ dev = ["pytest", "ruff"]
 models = ["torch", "transformers"]
 transforms = ["black", "libcst", "tree-sitter", "tree-sitter-language-pack"]
 train = ["jax", "flax", "optax", "numpy"]
+benchmarks = ["gdown"]
 
 [tool.ruff]
 line-length = 100
