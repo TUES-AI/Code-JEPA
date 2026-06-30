@@ -20,12 +20,46 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+import os as _os
+
 import pyarrow.parquet as pq
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from datasets import load_dataset, load_from_disk
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+
+# Approximate CodeSearchNet train-split function/docstring pair counts per
+# language (CodeSearchNet paper, Husain et al. 2019). Used only as sampling
+# weights for alpha=0.7 temperature mixing, not as exact counts.
+CODESEARCHNET_LANGUAGE_COUNTS = {
+    "python": 251_820,
+    "java": 164_923,
+    "javascript": 58_025,
+    "php": 241_241,
+    "go": 167_288,
+    "ruby": 24_927,
+}
+
+
+def _setup_distributed() -> tuple[int, int, int]:
+    """Init NCCL process group when running under torchrun. Returns (local_rank, rank, world_size)."""
+    if "LOCAL_RANK" not in _os.environ:
+        return 0, 0, 1
+    local_rank = int(_os.environ["LOCAL_RANK"])
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(local_rank)
+    return local_rank, dist.get_rank(), dist.get_world_size()
+
+
+def _is_dist() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def _unwrap(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DDP) else model
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -48,6 +82,8 @@ class Args:
     model_name: str = "assets/tokenizers/codesearchnet-python/bpe16k"
     dataset_name: str = "code_search_net"
     dataset_config: str = "python"
+    languages: list[str] | None = None
+    language_alpha: float = 0.7
     split: str = "train"
     local_dataset_dir: str = ""
     data_files: list[str] | None = None
@@ -81,6 +117,19 @@ def parse_args() -> Args:
     parser.add_argument("--model-name", default="assets/tokenizers/codesearchnet-python/bpe16k")
     parser.add_argument("--dataset-name", default="code_search_net")
     parser.add_argument("--dataset-config", default="python")
+    parser.add_argument(
+        "--languages",
+        nargs="+",
+        default=None,
+        help="Multiple CodeSearchNet language configs to mix with alpha-weighted sampling "
+        "(e.g. python java javascript go php ruby). Overrides --dataset-config when set.",
+    )
+    parser.add_argument(
+        "--language-alpha",
+        type=float,
+        default=0.7,
+        help="Temperature for language sampling weights: w_l = count_l^alpha, per UniXcoder/mBERT-style smoothing.",
+    )
     parser.add_argument("--split", default="train")
     parser.add_argument("--local-dataset-dir", default="")
     parser.add_argument("--data-files", nargs="+", default=None)
@@ -111,19 +160,35 @@ def parse_args() -> Args:
 
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
+    local_rank, rank, world_size = _setup_distributed()
+    set_seed(args.seed + rank)
     out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(json.dumps(asdict(args), indent=2, sort_keys=True) + "\n")
+    if rank == 0:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "config.json").write_text(json.dumps(asdict(args), indent=2, sort_keys=True) + "\n")
+    if _is_dist():
+        dist.barrier()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     ensure_unixcoder_special_tokens(tokenizer)
     model = build_model(args, tokenizer).to(device)
     param_count = count_parameters(model)
-    log(out, {"event": "model_built", "unique_parameters": param_count, "device": str(device)})
+    if rank == 0:
+        log(
+            out,
+            {
+                "event": "model_built",
+                "unique_parameters": param_count,
+                "device": str(device),
+                "world_size": world_size,
+            },
+        )
 
-    optimizer = make_optimizer(model, args)
+    if _is_dist():
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+
+    optimizer = make_optimizer(_unwrap(model), args)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup_steps,
@@ -131,21 +196,21 @@ def main() -> None:
     )
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and args.precision == "fp16"))
 
-    rows = raw_rows(args)
-    sampler = RawBatchSampler(rows, args)
-    eval_sampler = RawBatchSampler(raw_rows(args), args)
+    sampler = build_sampler(args, rank=rank, world_size=world_size, seed=args.seed + rank)
+    eval_sampler = build_sampler(args, rank=rank, world_size=world_size, seed=args.seed + 17 + rank)
     started = time.time()
     deadline = started + args.duration_hours * 3600 if args.duration_hours > 0 else math.inf
     step = 0
 
     for step in range(1, args.steps + 1):
         if time.time() >= deadline:
-            log(out, {"event": "deadline", "step": step})
+            if rank == 0:
+                log(out, {"event": "deadline", "step": step})
             break
         batch = sampler.next_batch(args.batch_size)
         metrics = train_step(model, tokenizer, optimizer, scheduler, scaler, batch, args, device)
         elapsed = time.time() - started
-        if step == 1 or step % args.log_every == 0:
+        if rank == 0 and (step == 1 or step % args.log_every == 0):
             metrics.update(
                 {
                     "event": "train",
@@ -156,16 +221,20 @@ def main() -> None:
                 }
             )
             log(out, metrics)
-        if args.eval_every > 0 and step % args.eval_every == 0:
-            log(out, {"event": "eval", "step": step, **evaluate(model, tokenizer, eval_sampler, args, device)})
-        if args.save_every > 0 and step % args.save_every == 0:
-            save_checkpoint(out, model, args, step)
+        if rank == 0 and args.eval_every > 0 and step % args.eval_every == 0:
+            log(out, {"event": "eval", "step": step, **evaluate(_unwrap(model), tokenizer, eval_sampler, args, device)})
+        if rank == 0 and args.save_every > 0 and step % args.save_every == 0:
+            save_checkpoint(out, _unwrap(model), args, step)
         if args.dry_run_batches and step >= args.dry_run_batches:
-            log(out, {"event": "dry_run_done", "step": step})
+            if rank == 0:
+                log(out, {"event": "dry_run_done", "step": step})
             break
 
-    save_checkpoint(out, model, args, step)
-    log(out, {"event": "done", "step": step, "elapsed_s": round(time.time() - started, 2)})
+    if rank == 0:
+        save_checkpoint(out, _unwrap(model), args, step)
+        log(out, {"event": "done", "step": step, "elapsed_s": round(time.time() - started, 2)})
+    if _is_dist():
+        dist.destroy_process_group()
 
 
 def build_model(args: Args, tokenizer: Any) -> SmallUniXcoder:
@@ -180,10 +249,10 @@ def build_model(args: Args, tokenizer: Any) -> SmallUniXcoder:
 
 
 class RawBatchSampler:
-    def __init__(self, rows: Iterable[dict[str, str]], args: Args) -> None:
+    def __init__(self, rows: Iterable[dict[str, str]], args: Args, *, seed: int | None = None) -> None:
         self.rows = iter(rows)
         self.args = args
-        self.rng = random.Random(args.seed)
+        self.rng = random.Random(seed if seed is not None else args.seed)
         self.buffer: list[dict[str, str]] = []
 
     def next_batch(self, batch_size: int) -> dict[str, list[str]]:
@@ -216,10 +285,24 @@ class RawBatchSampler:
         return row
 
 
-def raw_rows(args: Args) -> Iterator[dict[str, str]]:
+def build_sampler(args: Args, *, rank: int, world_size: int, seed: int) -> "RawBatchSampler | MultiLangBatchSampler":
+    if args.languages:
+        per_language = {
+            language: RawBatchSampler(
+                raw_rows(args, language=language, rank=rank, world_size=world_size), args, seed=seed
+            )
+            for language in args.languages
+        }
+        return MultiLangBatchSampler(per_language, alpha=args.language_alpha, seed=seed)
+    return RawBatchSampler(raw_rows(args, language=None, rank=rank, world_size=world_size), args, seed=seed)
+
+
+def raw_rows(
+    args: Args, *, language: str | None, rank: int, world_size: int
+) -> Iterator[dict[str, str]]:
     while True:
         yielded = 0
-        for row in iter_once(args):
+        for row in iter_once(args, language=language, rank=rank, world_size=world_size):
             code = str(row.get("whole_func_string") or row.get("func_code_string") or row.get("code") or "").strip()
             doc = str(row.get("func_documentation_string") or row.get("docstring") or row.get("doc") or "").strip()
             if len(code.split()) < args.min_code_tokens or len(doc.split()) < args.min_doc_tokens:
@@ -229,24 +312,61 @@ def raw_rows(args: Args) -> Iterator[dict[str, str]]:
             if args.max_rows_in_memory > 0 and yielded >= args.max_rows_in_memory:
                 break
         if yielded == 0:
-            raise RuntimeError("raw dataset produced no usable code/doc rows")
+            raise RuntimeError(f"raw dataset produced no usable code/doc rows (language={language})")
 
 
-def iter_once(args: Args) -> Iterable[dict[str, Any]]:
+def iter_once(
+    args: Args, *, language: str | None, rank: int, world_size: int
+) -> Iterable[dict[str, Any]]:
     if args.data_files:
         return iter_data_files([Path(path) for path in args.data_files])
     if args.local_dataset_dir:
         dataset = load_from_disk(args.local_dataset_dir)
         split = dataset[args.split] if hasattr(dataset, "keys") and args.split in dataset else dataset
         return iter(split)
-    return iter(
-        load_dataset(
-            args.dataset_name,
-            args.dataset_config,
-            split=args.split,
-            streaming=args.streaming,
-        )
+    dataset = load_dataset(
+        args.dataset_name,
+        language or args.dataset_config,
+        split=args.split,
+        streaming=args.streaming,
     )
+    if args.streaming and world_size > 1:
+        dataset = dataset.shard(num_shards=world_size, index=rank)
+    return iter(dataset)
+
+
+class MultiLangBatchSampler:
+    """Mixes per-language RawBatchSamplers with alpha-smoothed language sampling.
+
+    w_l = count_l^alpha / sum(count_l'^alpha), matching the UniXcoder/mBERT-style
+    smoothing used to avoid over-sampling high-resource languages.
+    """
+
+    def __init__(self, per_language: dict[str, "RawBatchSampler"], *, alpha: float, seed: int) -> None:
+        self.per_language = per_language
+        self.languages = list(per_language.keys())
+        weights = [CODESEARCHNET_LANGUAGE_COUNTS.get(lang, 1) ** alpha for lang in self.languages]
+        total = sum(weights)
+        self.probs = [w / total for w in weights]
+        self.rng = random.Random(seed)
+
+    def next_batch(self, batch_size: int) -> dict[str, list[str]]:
+        codes: list[str] = []
+        docs: list[str] = []
+        for _ in range(batch_size):
+            language = self.rng.choices(self.languages, weights=self.probs, k=1)[0]
+            row = self.per_language[language]._next_row()  # noqa: SLF001
+            if not row:
+                continue
+            codes.append(row["code"])
+            docs.append(row["doc"])
+        while len(codes) < batch_size:
+            language = self.rng.choices(self.languages, weights=self.probs, k=1)[0]
+            row = self.per_language[language]._next_row()  # noqa: SLF001
+            if row:
+                codes.append(row["code"])
+                docs.append(row["doc"])
+        return {"code": codes, "doc": docs}
 
 
 def iter_data_files(paths: list[Path]) -> Iterator[dict[str, Any]]:
@@ -291,7 +411,7 @@ def train_step(
     amp_dtype = autocast_dtype(args.precision)
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda" and amp_dtype is not None)):
         code_hidden = model(**code_inputs).last_hidden_state
-        logits = model.lm_head(code_hidden)
+        logits = _unwrap(model).lm_head(code_hidden)
         mlm_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
         code_vec = pool(code_hidden, code_inputs["attention_mask"])
         doc_vec = encode(model, doc_inputs)
