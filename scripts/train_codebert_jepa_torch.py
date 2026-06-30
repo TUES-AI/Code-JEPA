@@ -131,6 +131,39 @@ class Predictor(nn.Module):
         return self.net(x)
 
 
+class _RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return norm * self.weight
+
+
+class ProjectionHead(nn.Module):
+    """h -> Dense(8H) -> split 4H/4H -> SwiGLU -> RMSNorm -> Dense(D).
+
+    Keeps the reusable pooled embedding `h` untouched; JEPA/rank/SIGReg losses
+    train on this projected space `z` instead, per Project.md's pooling/head decision.
+    """
+
+    def __init__(self, dim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.dense_in = nn.Linear(dim, dim * 8)
+        self.norm = _RMSNorm(dim * 4)
+        self.dropout = nn.Dropout(dropout)
+        self.dense_out = nn.Linear(dim * 4, dim)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        x1, x2 = self.dense_in(h).chunk(2, dim=-1)
+        x = x1 * F.silu(x2)
+        x = self.norm(x)
+        x = self.dropout(x)
+        return self.dense_out(x)
+
+
 class ShardSampler:
     def __init__(
         self,
@@ -293,6 +326,7 @@ def train(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str], o
             log(out, {"event": "tokenizer_added_unixcoder_tokens", "count": added})
     ctx = build_model(args, tokenizer).to(device)
     hidden_size = int(ctx.config.hidden_size)
+    projector = ProjectionHead(hidden_size, args.dropout).to(device)
     predictor = Predictor(hidden_size, args.dropout).to(device)
     sigreg = SlicedGaussianRegularizer(num_slices=args.sigreg_slices).to(device)
     parameter_count = count_parameters(ctx)
@@ -315,12 +349,18 @@ def train(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str], o
 
     if _is_dist():
         ctx = DDP(ctx, device_ids=[local_rank], find_unused_parameters=True)
+        projector = DDP(projector, device_ids=[local_rank], find_unused_parameters=True)
         predictor = DDP(predictor, device_ids=[local_rank], find_unused_parameters=True)
 
     if args.compile:
         predictor = torch.compile(predictor)  # type: ignore[assignment]
 
-    optimizer = make_optimizer(list(_unwrap(ctx).parameters()) + list(_unwrap(predictor).parameters()), args)
+    optimizer = make_optimizer(
+        list(_unwrap(ctx).parameters())
+        + list(_unwrap(projector).parameters())
+        + list(_unwrap(predictor).parameters()),
+        args,
+    )
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup_steps,
@@ -342,6 +382,7 @@ def train(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str], o
         batch = sampler.next_batch(args.batch_size)
         metrics = train_step(
             ctx,
+            projector,
             predictor,
             sigreg,
             tokenizer,
@@ -376,15 +417,17 @@ def train(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str], o
                 log(out, {"event": "dry_run_done", "step": step})
             break
         if args.eval_every > 0 and step % args.eval_every == 0 and rank == 0:
-            eval_metrics = evaluate_batches(_unwrap(ctx), _unwrap(predictor), tokenizer, eval_sampler, args, device)
+            eval_metrics = evaluate_batches(
+                _unwrap(ctx), _unwrap(projector), _unwrap(predictor), tokenizer, eval_sampler, args, device
+            )
             log(out, {"event": "eval", "step": step, **eval_metrics})
         if args.save_every > 0 and step % args.save_every == 0 and rank == 0:
-            save_light_checkpoint(out, _unwrap(ctx), _unwrap(predictor), args, step)
+            save_light_checkpoint(out, _unwrap(ctx), _unwrap(projector), _unwrap(predictor), args, step)
         if args.s3_output_prefix and args.s3_sync_every > 0 and step % args.s3_sync_every == 0 and rank == 0:
             sync_s3(out, args.s3_output_prefix)
 
     if rank == 0:
-        save_light_checkpoint(out, _unwrap(ctx), _unwrap(predictor), args, step)
+        save_light_checkpoint(out, _unwrap(ctx), _unwrap(projector), _unwrap(predictor), args, step)
         if args.s3_output_prefix:
             sync_s3(out, args.s3_output_prefix)
         log(out, {"event": "done", "step": step, "elapsed_s": round(time.time() - started, 2)})
@@ -394,6 +437,7 @@ def train(args: TrainArgs, pairs: list[ShardPair], view_by_id: dict[str, str], o
 
 def train_step(
     ctx: nn.Module,
+    projector: nn.Module,
     predictor: nn.Module,
     sigreg: SlicedGaussianRegularizer,
     tokenizer: Any,
@@ -405,6 +449,7 @@ def train_step(
     device: torch.device,
 ) -> dict[str, float]:
     ctx.train()
+    projector.train()
     predictor.train()
     anchors, positives, negatives = batch
     unixcoder_mode = isinstance(ctx, SmallUniXcoder)
@@ -430,8 +475,11 @@ def train_step(
         dtype=amp_dtype,
         enabled=(device.type == "cuda" and amp_dtype is not None),
     ):
-        za = encode(ctx, anchor_inputs)
-        zp, zn = encode(ctx, view_inputs).chunk(2, dim=0)
+        ha = encode(ctx, anchor_inputs)
+        hp, hn = encode(ctx, view_inputs).chunk(2, dim=0)
+        za = projector(ha)
+        zp = projector(hp)
+        zn = projector(hn)
         pred = predictor(za)
         pred_n = F.normalize(pred, dim=-1)
         zp_n = F.normalize(zp, dim=-1)
@@ -485,6 +533,7 @@ def train_step(
 @torch.no_grad()
 def evaluate_batches(
     model: nn.Module,
+    projector: nn.Module,
     predictor: nn.Module,
     tokenizer: Any,
     sampler: ShardSampler,
@@ -492,6 +541,7 @@ def evaluate_batches(
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
+    projector.eval()
     predictor.eval()
     losses = []
     rank_accs = []
@@ -520,8 +570,9 @@ def evaluate_batches(
             dtype=amp_dtype,
             enabled=(device.type == "cuda" and amp_dtype is not None),
         ):
-            pred = F.normalize(predictor(encode(model, anchor_inputs)), dim=-1)
-            zp, zn = encode(model, view_inputs).chunk(2, dim=0)
+            pred = F.normalize(predictor(projector(encode(model, anchor_inputs))), dim=-1)
+            hp, hn = encode(model, view_inputs).chunk(2, dim=0)
+            zp, zn = projector(hp), projector(hn)
             zp = F.normalize(zp, dim=-1)
             zn = F.normalize(zn, dim=-1)
             sim_pos = torch.sum(pred * zp, dim=-1)
@@ -552,11 +603,14 @@ def evaluate_checkpoint(args: TrainArgs, pairs: list[ShardPair], view_by_id: dic
         ensure_unixcoder_special_tokens(tokenizer)
     model = model_from_checkpoint(checkpoint, model_name).to(device)
     hidden_size = int(model.config.hidden_size)
+    projector = ProjectionHead(hidden_size, args.dropout).to(device)
     predictor = Predictor(hidden_size, args.dropout).to(device)
     model.load_state_dict(checkpoint["ctx_model"])
+    if "projector" in checkpoint:
+        projector.load_state_dict(checkpoint["projector"])
     predictor.load_state_dict(checkpoint["predictor"])
     sampler = ShardSampler(pairs, view_by_id, seed=args.seed + 101)
-    return evaluate_batches(model, predictor, tokenizer, sampler, args, device)
+    return evaluate_batches(model, projector, predictor, tokenizer, sampler, args, device)
 
 
 def build_model(args: TrainArgs, tokenizer: Any) -> nn.Module:
@@ -639,7 +693,7 @@ def tokenize(
 
 
 def save_light_checkpoint(
-    out: Path, ctx: nn.Module, predictor: nn.Module, args: TrainArgs, step: int
+    out: Path, ctx: nn.Module, projector: nn.Module, predictor: nn.Module, args: TrainArgs, step: int
 ) -> None:
     payload = {
         "step": step,
@@ -647,6 +701,7 @@ def save_light_checkpoint(
         "model_class": model_class_name(ctx),
         "model_config": ctx.config.to_dict() if hasattr(ctx, "config") else {},
         "ctx_model": {k: v.detach().cpu() for k, v in ctx.state_dict().items()},
+        "projector": {k: v.detach().cpu() for k, v in projector.state_dict().items()},
         "predictor": {k: v.detach().cpu() for k, v in predictor.state_dict().items()},
         "args": asdict(args),
     }
