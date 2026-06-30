@@ -1,0 +1,212 @@
+\documentclass[11pt]{article}
+
+\usepackage[review]{acl}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{inconsolata}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{array}
+
+\title{Code-JEPA: Learning Code Representations in Latent Space}
+
+\author{First Author \\
+  Affiliation / Address line 1 \\
+  \texttt{email@domain} \\\And
+  Second Author \\
+  Affiliation / Address line 1 \\
+  \texttt{email@domain} \\}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Code-JEPA trains compact code encoders with joint embedding prediction over
+semantics-preserving code views and hard negatives. Predictive and ranking losses
+act in a projected latent space, leaving the pooled encoder embedding reusable
+for downstream tasks. We sketch the method and a same-scale comparison protocol
+against compact CodeBERT-, GraphCodeBERT-, TreeBERT-, and UniXcoder-style
+baselines.
+\end{abstract}
+
+\section{Introduction}
+
+Pretrained code encoders are usually optimized with token reconstruction,
+natural-language alignment, or structure-aware auxiliary tasks. These objectives
+learn useful representations, but they do not directly ask a model to predict
+which semantics-preserving code variants should be close and which hard
+negatives should be separated. Code-JEPA explores this question with a compact
+joint embedding predictive architecture for code.
+
+The main design issue is where to apply predictive and ranking pressure. If the
+rank loss acts directly on the pooled encoder embedding, downstream tasks inherit
+distortions introduced by hard-negative training. We instead keep the pooled
+encoder representation \(h\) as the reusable embedding and train the predictive
+objective in a projected latent space \(z\). This paper asks whether that
+separation improves code representation learning under a small-model budget.
+
+Our contributions are: (i) a Code-JEPA objective for transformed code views and
+hard negatives, (ii) a projection-head design that protects downstream
+embeddings from direct rank-loss distortion, and (iii) a same-scale experimental
+protocol comparing Code-JEPA to compact CodeBERT-, GraphCodeBERT-, TreeBERT-,
+and UniXcoder-style baselines.
+
+\begin{figure*}[t!]
+  \centering
+  \setlength{\fboxsep}{4pt}
+  \footnotesize
+  \begin{tabular}{@{}c@{\hspace{0.5em}}c@{\hspace{0.5em}}c@{\hspace{0.5em}}c@{\hspace{0.5em}}c@{}}
+    \fbox{\begin{minipage}{0.16\linewidth}\centering
+      Anchor code\\[-1pt]\texttt{x\_a}
+    \end{minipage}}
+    &
+    \fbox{\begin{minipage}{0.16\linewidth}\centering
+      Positive view\\[-1pt]\texttt{x\_p}
+    \end{minipage}}
+    &
+    \fbox{\begin{minipage}{0.16\linewidth}\centering
+      Hard negative\\[-1pt]\texttt{x\_n}
+    \end{minipage}}
+    &
+    \fbox{\begin{minipage}{0.18\linewidth}\centering
+      Shared encoder\\[-1pt]\(f_\theta\)
+    \end{minipage}}
+    &
+    \fbox{\begin{minipage}{0.18\linewidth}\centering
+      Downstream tasks\\[-1pt]use \(h\)
+    \end{minipage}}
+    \\
+    \multicolumn{3}{c}{\(\underbrace{\hspace{0.54\linewidth}}_{\text{semantics-preserving transforms and hard-negative mining}}\)}
+    & \(\longrightarrow\)
+    & \(\longrightarrow\)
+  \end{tabular}
+
+  \vspace{0.5em}
+  \begin{tabular}{@{}c@{\hspace{0.45em}}c@{\hspace{0.45em}}c@{\hspace{0.45em}}c@{\hspace{0.45em}}c@{\hspace{0.45em}}c@{\hspace{0.45em}}c@{}}
+    \fbox{\begin{minipage}{0.20\linewidth}\centering
+      \(h_i=\mathrm{Pool}(f_\theta(x_i))\)\\
+      reusable embedding
+    \end{minipage}}
+    \(\longrightarrow\)
+    \fbox{\begin{minipage}{0.22\linewidth}\centering
+      Projection head \(g_\phi\)\\
+      Dense \(8H\), SwiGLU, RMSNorm
+    \end{minipage}}
+    \(\longrightarrow\)
+    \fbox{\begin{minipage}{0.20\linewidth}\centering
+      \(z_i=g_\phi(h_i)\)\\
+      JEPA latent space
+    \end{minipage}}
+    \(\longrightarrow\)
+    \fbox{\begin{minipage}{0.20\linewidth}\centering
+      Predictor \(q_\psi\)\\
+      \(\hat{z}_a=q_\psi(z_a)\)
+    \end{minipage}}
+  \end{tabular}
+
+  \vspace{0.5em}
+  \begin{equation}
+    \begin{aligned}
+      \mathcal{L}_{\mathrm{pred}} &= \|\hat{z}_a-\mathrm{sg}(z_p)\|_2^2,\\
+      \mathcal{L}_{\mathrm{rank}} &= \max(0, m+\cos(\hat{z}_a,\mathrm{sg}(z_n))
+          -\cos(\hat{z}_a,\mathrm{sg}(z_p))),\\
+      \mathcal{L} &= \mathcal{L}_{\mathrm{pred}}
+        +\lambda_r\mathcal{L}_{\mathrm{rank}}
+        +\lambda_b\mathcal{L}_{\mathrm{inbatch}}
+        +\lambda_s\mathcal{L}_{\mathrm{sigreg}} .
+    \end{aligned}
+  \end{equation}
+  \caption{Code-JEPA architecture sketch. The reusable downstream embedding
+  \(h\) is kept separate from the projected latent \(z\), where JEPA, rank,
+  in-batch, and SIGReg losses are applied.}
+  \label{fig:architecture}
+\end{figure*}
+
+\section{Method}
+
+\paragraph{Code views.}
+Given a Python function, we construct transformed views using formatting,
+normalization, docstring/comment changes, and syntax-preserving edits. A training
+triple consists of an anchor \(x_a\), a positive view \(x_p\), and a hard
+negative \(x_n\) selected to be locally plausible but semantically farther.
+
+\paragraph{Encoder and projection head.}
+All models use a small UniXcoder-style RoBERTa backbone in the main experiments.
+The encoder produces token states that are mean-pooled into \(h\). Code-JEPA then
+uses a projection head \(g_\phi\) before applying predictive or ranking losses:
+Dense \(8H\), split into two \(4H\) branches, SwiGLU, RMSNorm, and Dense \(H\).
+This keeps \(h\) aligned with downstream use while allowing \(z\) to absorb
+hard-negative pressure.
+
+\paragraph{Objective.}
+The predictor \(q_\psi\) maps the projected anchor \(z_a\) to \(\hat{z}_a\).
+The positive and negative targets are stop-gradient latents. We combine a latent
+prediction loss, a margin rank loss, an in-batch contrastive loss, and SIGReg
+regularization. The rank weight is the main Code-JEPA knob; the matched control
+sets it to zero.
+
+\section{Experiments}
+
+\paragraph{Pretraining data.}
+Code-JEPA uses transformed CodeSearchNet Python views and triples. The raw
+UniXcoder-style baseline uses raw CodeSearchNet Python function/docstring pairs
+with masked language modeling and code-doc contrastive learning. All small-model
+runs use the same tokenizer and comparable backbone scale.
+
+\paragraph{Downstream tasks.}
+We evaluate on POJ-104 clone retrieval with MAP@R and BigCloneBench clone
+detection with F1 and ROC-AUC. Fine-tuning reads the pooled encoder embedding
+\(h\), not the projection head, so the downstream protocol directly tests the
+quality of the reusable representation.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \begin{tabular}{lcccccc}
+    \hline
+    \textbf{Model} & \textbf{Scale} & \textbf{Pretraining data} & \textbf{Objective} &
+    \textbf{Hard neg.} & \textbf{POJ MAP@R} & \textbf{BCB F1 / AUC} \\
+    \hline
+    Small CodeBERT-style & same & CodeSearchNet raw & MLM & no & TBD & TBD \\
+    Small GraphCodeBERT-style & same & Code + graph signal & MLM + graph & partial & TBD & TBD \\
+    Small TreeBERT-style & same & Code + AST signal & tree-aware MLM & no & TBD & TBD \\
+    Small UniXcoder-style & same & CodeSearchNet raw & MLM + code-doc CL & no & 0.440 & 0.917 / 0.977 \\
+    Code-JEPA & same & CodeSearchNet transforms & JEPA + rank + SIGReg & yes & TBD & TBD \\
+    \hline
+  \end{tabular}
+  \caption{Planned same-scale comparison table. Values marked TBD should be
+  filled only after running the corresponding small baselines under the same
+  tokenizer, data budget, fine-tuning code, and seed protocol. Existing raw
+  UniXcoder numbers are included as a placeholder reference.}
+  \label{tab:comparison}
+\end{table*}
+
+\section{Results and Ablations}
+
+Table~\ref{tab:comparison} shows the intended reporting format. The key claim
+should be made only for models trained under the same scale and budget. Current
+evidence suggests that raw CodeSearchNet pretraining is a strong baseline, while
+Code-JEPA targets hard-negative separation. The projector-fixed Code-JEPA run
+should replace older checkpoints trained before losses were moved from \(h\) to
+\(z\).
+
+\paragraph{Ablations.}
+We report three compact ablations: (i) rank weight \(0\) versus \(0.5\), (ii)
+directly training \(h\) versus training projected \(z\), and (iii) transformed
+view stage or hard-negative source. The most important ablation is the projection
+head, since downstream tasks consume \(h\).
+
+\section{Limitations and Conclusion}
+
+This work is not a reproduction of the original UniXcoder training recipe: it is
+a small-model comparison built around Python CodeSearchNet. The full UniXcoder
+recipe uses larger models, multiple languages, AST information, and additional
+generation/denoising modes. The workshop version should therefore claim a
+same-scale Code-JEPA comparison, not a full replacement for published foundation
+models. Code-JEPA is most defensible as a method for adding hard-negative latent
+prediction while preserving a reusable code embedding.
+
+\end{document}
