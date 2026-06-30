@@ -24,6 +24,26 @@ prints a concise summary instead of raw RunPod payloads.
 * Prefer the helper script over manual commands.
 * Use exact GPU if the user asks for one, otherwise use `--gpu auto`.
 * `--spot` means interruptible Secure Cloud via REST.
+* The repo must not be baked into the image or stored in S3.
+* S3 is only for data/tokenizers/checkpoints/artifacts.
+
+## Runtime layout
+
+```text
+/proj               root home and login/work dir
+/proj/Code-JEPA     repo copied from local machine after pod startup
+/proj/s3            full s3://code-jepa/ mirror, synced on startup
+/proj/huggingface   HF cache
+/opt/venv           image Python/JAX/PyTorch env, outside the /proj volume
+```
+
+The image starts Tailscale and runs:
+
+```bash
+sync-code-jepa-all
+```
+
+which mirrors `s3://code-jepa/` to `/proj/s3/`. Do not create `sync_dirs.txt`, S3 `entrypoint.sh`, or repo tarballs for normal deployment.
 
 ## Recommended commands
 
@@ -69,26 +89,6 @@ NVIDIA RTX A6000 -> NVIDIA RTX A5000 -> NVIDIA RTX A4500 -> NVIDIA RTX A4000 -> 
 
 This matches the user's preferred fallback order.
 
-# How to prepare before the pod starts
-
-1. Make sure all the needed data is in the S3 bucket
-2. Create a sync_dirs.txt and entrypoint.sh which will be read on Pod startup, synced and executed. They live locally on the mac at:
-```
-/proj/code-jepa/sync_dirs.txt
-/proj/code-jepa/entrypoint.sh
-```
-You will edit them and overwrite them for the current task. Preffer tmux for the entrypoint for the user to be easy to monitor.
-
-3. Sync them to the S3 
-```bash
-s5cmd cp sync_dirs.txt "s3://code-jepa/sync_dirs.txt" && s5cmd cp entrypoint.sh "s3://code-jepa/entrypoint.sh"
-```
-
-Now whatever is in the S3 and stated in sync_dirs.txt will be on the pod on startup and whatever it was in entrypoint.sh will be ran so the gpu can start working right away if needed.
-
-This workflow is for training jobs, for quick tests it is not needed to have a entrypoing.sh
-
-
 # What to do when the Pod starts
 
 After the pod is created, check for its Tailscale host:
@@ -99,34 +99,45 @@ tailscale status | rg gpu
 
 Do **not** wait blindly on Tailscale. If the host is not visible after 3-5 minutes, treat it as a startup failure and inspect the pod logs in the RunPod UI before waiting longer. The local `runpodctl` version does not expose container logs.
 
+Copy the current local repo state from the repo root after SSH works:
+
+```bash
+ssh root@gpu-box 'rm -rf /proj/Code-JEPA && mkdir -p /proj/Code-JEPA'
+git ls-files -z --cached --others --exclude-standard \
+  | rsync -az --from0 --files-from=- ./ root@gpu-box:/proj/Code-JEPA/
+ssh root@gpu-box 'cd /proj/Code-JEPA && /opt/venv/bin/pip install -e ".[dev,transforms]"'
+```
+
+This sends tracked files plus untracked non-ignored files, and avoids copying `.git`, `.env`, local datasets, checkpoints, and caches.
+
 Bad startup signs to look for in logs:
 
 ```text
 s3://giant-data/
 /proj/giant-data
+/proj/code-jepa
+/opt/code-jepa-image
 Code-JEPA/repo/code-jepa-*.tar.gz
-sync_dirs.txt from s3://giant-data/sync_dirs.txt
-NoSuchKey / 404 for giant-data objects
+sync_dirs.txt from S3
 entrypoint never reaches Tailscale startup / no [code-jepa] ready line
 ```
 
-If any of those appear, the pod is using the wrong old startup/template path. Remove it immediately and fix the template/startup config before creating another pod; do not leave it retrying. The Code-JEPA path must use `s3://code-jepa/`, `/proj/code-jepa`, and the Code-JEPA image entrypoint.
+If any of those appear, the pod is using an old startup/template path. Remove it immediately and fix the template/startup config before creating another pod; do not leave it retrying.
 
 You should run commands on the remote GPU only as described in the `gpu-remote-exec` skill.
 
 # What to do when the Pod stops / you are terminating it
 
-When you stop or terminate the pod, push the generated artifacts to S3 first:
+When you stop or terminate the pod, push generated artifacts to S3 first, for example:
 
 ```bash
-s5cmd sync --size-only /proj/code-jepa/checkpoints/ "s3://code-jepa/checkpoints/"
+s5cmd sync --size-only /proj/s3/checkpoints/ "s3://code-jepa/checkpoints/"
 ```
 
-Replace that path with the current job's checkpoint/output directory.
-
-Pods are ephemeral; upload artifacts before removal.
+Replace that path with the current job's checkpoint/output directory. Pods are ephemeral; upload artifacts before removal.
 
 ## Notes
+
 * The helper script reads `RUNPOD_API_KEY` from the environment or `~/.runpod/config.toml`.
 * `--wait` calls `.claude/skills/deploy-gpu/scripts/wait-new-gpu.sh` for you.
 * Use spot only if the user explicitly asked for it.

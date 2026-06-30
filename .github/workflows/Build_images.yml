@@ -6,13 +6,7 @@ on:
     branches: [main]
     paths:
       - "CICD/Docker/code-jepa-training/**"
-      - ".dockerignore"
       - ".github/workflows/Build_images.yml"
-      - "pyproject.toml"
-      - "README.md"
-      - "src/**"
-      - "scripts/**"
-      - "tests/**"
 
 permissions:
   contents: read
@@ -36,12 +30,6 @@ jobs:
           filters: |
             image:
               - "CICD/Docker/code-jepa-training/**"
-              - ".dockerignore"
-              - "pyproject.toml"
-              - "README.md"
-              - "src/**"
-              - "scripts/**"
-              - "tests/**"
             workflow:
               - ".github/workflows/Build_images.yml"
 
@@ -63,7 +51,7 @@ jobs:
               . + [{
                 image_name: "code-jepa-training",
                 image_repo: "code-jepa",
-                context: ".",
+                context: "./CICD/Docker/code-jepa-training",
                 dockerfile: "./CICD/Docker/code-jepa-training/Dockerfile",
                 tag: "latest"
               }]' <<< "$include")

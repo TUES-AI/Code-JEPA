@@ -20,9 +20,10 @@ import random
 import subprocess
 import sys
 import time
+from collections import defaultdict
 from functools import partial
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,7 @@ class TrainConfig:
     steps: int = 1_000_000
     duration_minutes: float = 30.0
     seed: int = 0
+    model_size: str = "roberta_25m"
     hidden_size: int = 512
     projection_dim: int = 512
     layers: int = 6
@@ -81,6 +83,7 @@ class TrainConfig:
     resume: str = ""
     dry_run_steps: int = 0
     loader_prefetch: int = 1
+    target_epochs: float = 1.0
 
 
 class TrainState(train_state.TrainState):
@@ -107,40 +110,36 @@ class CudnnSelfAttention(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, valid_tokens: jnp.ndarray, *, deterministic: bool) -> jnp.ndarray:
+        if self.hidden_size % self.heads != 0:
+            raise ValueError(f"hidden_size {self.hidden_size} must be divisible by heads {self.heads}")
+        head_dim = self.hidden_size // self.heads
         lengths = jnp.maximum(jnp.sum(valid_tokens, axis=1).astype(jnp.int32), 1)
-
-        def attention_fn(
-            query: jnp.ndarray,
-            key: jnp.ndarray,
-            value: jnp.ndarray,
-            *,
-            mask: jnp.ndarray | None = None,
-            dropout_rate: float = 0.0,
-            deterministic: bool = True,
-            dtype: Any = None,
-            precision: Any = None,
-        ) -> jnp.ndarray:
-            del mask, dropout_rate, deterministic, precision
-            y = jax.nn.dot_product_attention(
-                query,
-                key,
-                value,
-                query_seq_lengths=lengths,
-                key_value_seq_lengths=lengths,
-                implementation="cudnn",
-            )
-            return y.astype(dtype) if dtype is not None else y
-
-        y = nn.MultiHeadDotProductAttention(
-            num_heads=self.heads,
-            qkv_features=self.hidden_size,
-            out_features=self.hidden_size,
-            dropout_rate=0.0,
+        qkv = nn.DenseGeneral(
+            features=(3, self.heads, head_dim),
+            axis=-1,
             dtype=self.dtype,
             param_dtype=jnp.float32,
-            attention_fn=attention_fn,
-            name="mha",
-        )(x, x, mask=None, deterministic=deterministic)
+            name="qkv",
+        )(x)
+        query = qkv[:, :, 0, :, :]
+        key = qkv[:, :, 1, :, :]
+        value = qkv[:, :, 2, :, :]
+        implementation = "cudnn" if jax.default_backend() == "gpu" else None
+        y = jax.nn.dot_product_attention(
+            query,
+            key,
+            value,
+            query_seq_lengths=lengths,
+            key_value_seq_lengths=lengths,
+            implementation=implementation,
+        )
+        y = nn.DenseGeneral(
+            features=self.hidden_size,
+            axis=(-2, -1),
+            dtype=self.dtype,
+            param_dtype=jnp.float32,
+            name="out",
+        )(y)
         return nn.Dropout(rate=self.dropout)(y, deterministic=deterministic)
 
 
@@ -190,6 +189,19 @@ class ProjectionHead(nn.Module):
         return z.astype(jnp.float32)
 
 
+class PredictorHead(nn.Module):
+    projection_dim: int
+    dtype: Any
+
+    @nn.compact
+    def __call__(self, z: jnp.ndarray) -> jnp.ndarray:
+        y = RMSNorm(dtype=self.dtype, name="norm_in")(z)
+        y = nn.Dense(self.projection_dim * 4, dtype=self.dtype, param_dtype=jnp.float32, name="expand")(y)
+        y = nn.gelu(y)
+        y = nn.Dense(self.projection_dim, dtype=self.dtype, param_dtype=jnp.float32, name="project")(y)
+        return y.astype(jnp.float32)
+
+
 class SiameseEncoder(nn.Module):
     cfg: TrainConfig
 
@@ -210,7 +222,7 @@ class SiameseEncoder(nn.Module):
             (self.cfg.max_len, self.cfg.hidden_size),
             jnp.float32,
         )
-        x = token_embed + pos_embed[None, :, :].astype(dtype)
+        x = token_embed + pos_embed[None, : token_ids.shape[1], :].astype(dtype)
         for _ in range(self.cfg.layers):
             x = EncoderLayer(
                 hidden_size=self.cfg.hidden_size,
@@ -234,12 +246,17 @@ class SiameseModel(nn.Module):
     cfg: TrainConfig
 
     @nn.compact
-    def __call__(self, tokens: jnp.ndarray, *, deterministic: bool) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def __call__(self, tokens: jnp.ndarray, *, deterministic: bool) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         batch, views, length = tokens.shape
         flat = tokens.reshape(batch * views, length).astype(jnp.int32)
         encoded = SiameseEncoder(self.cfg)(flat, deterministic=deterministic)
         za, zp, zn = encoded.reshape(batch, views, -1).transpose(1, 0, 2)
-        return za, zp, zn
+        pred = PredictorHead(
+            projection_dim=self.cfg.projection_dim,
+            dtype=precision_dtype(self.cfg.precision),
+            name="predictor",
+        )(za)
+        return pred, za, zp, zn
 
 
 class TokenizedShardLoader:
@@ -263,20 +280,16 @@ class TokenizedShardLoader:
         self._activate_next()
 
     def next_batch(self) -> np.ndarray:
-        chunks = []
-        remaining = self.batch_size
-        while remaining > 0:
-            if self.tokens is None or self.example_pos >= len(self.example_order):
+        for _ in range(len(self.shards) + 1):
+            if self.tokens is None or self.example_pos + self.batch_size > len(self.example_order):
                 self._activate_next()
             assert self.tokens is not None
-            take = min(remaining, len(self.example_order) - self.example_pos)
-            indices = self.example_order[self.example_pos : self.example_pos + take]
-            chunks.append(self.tokens[indices])
-            self.example_pos += take
-            remaining -= take
-        if len(chunks) == 1:
-            return chunks[0].astype(np.int32, copy=False)
-        return np.concatenate(chunks, axis=0).astype(np.int32, copy=False)
+            if len(self.example_order) < self.batch_size:
+                continue
+            indices = self.example_order[self.example_pos : self.example_pos + self.batch_size]
+            self.example_pos += self.batch_size
+            return self.tokens[indices].astype(np.int32, copy=False)
+        raise ValueError(f"all tokenized shards are smaller than batch_size={self.batch_size}")
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -331,6 +344,7 @@ def parse_args() -> TrainConfig:
     p.add_argument("--steps", type=int, default=1_000_000)
     p.add_argument("--duration-minutes", type=float, default=30.0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--model-size", choices=["roberta_20m", "roberta_25m", "roberta_30m", "custom"], default="roberta_25m")
     p.add_argument("--hidden-size", type=int, default=512)
     p.add_argument("--projection-dim", type=int, default=512)
     p.add_argument("--layers", type=int, default=6)
@@ -359,7 +373,23 @@ def parse_args() -> TrainConfig:
     p.add_argument("--resume", default="")
     p.add_argument("--dry-run-steps", type=int, default=0)
     p.add_argument("--loader-prefetch", type=int, default=1)
-    return TrainConfig(**vars(p.parse_args()))
+    p.add_argument("--target-epochs", type=float, default=1.0)
+    return apply_model_preset(TrainConfig(**vars(p.parse_args())))
+
+
+MODEL_PRESETS: dict[str, dict[str, int]] = {
+    # Total trainable parameters include embeddings, encoder, projection head, and predictor.
+    "roberta_20m": {"hidden_size": 384, "projection_dim": 384, "layers": 6, "heads": 6, "intermediate_size": 1536},
+    "roberta_25m": {"hidden_size": 448, "projection_dim": 448, "layers": 6, "heads": 7, "intermediate_size": 1792},
+    "roberta_30m": {"hidden_size": 512, "projection_dim": 512, "layers": 6, "heads": 8, "intermediate_size": 2048},
+}
+
+
+def apply_model_preset(cfg: TrainConfig) -> TrainConfig:
+    if cfg.model_size == "custom":
+        return cfg
+    values = MODEL_PRESETS[cfg.model_size]
+    return replace(cfg, **values)
 
 
 def main() -> None:
@@ -371,15 +401,17 @@ def main() -> None:
     (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2, sort_keys=True) + "\n")
 
     manifests = [load_manifest(Path(path)) for path in cfg.data_dirs]
-    if manifests:
-        first = manifests[0]
-        if int(first.get("max_len", cfg.max_len)) != cfg.max_len:
-            raise ValueError(f"manifest max_len {first.get('max_len')} != --max-len {cfg.max_len}")
-        if int(first.get("vocab_size", cfg.vocab_size)) != cfg.vocab_size:
-            raise ValueError(f"manifest vocab_size {first.get('vocab_size')} != --vocab-size {cfg.vocab_size}")
+    for manifest in [item for item in manifests if item]:
+        manifest_max_len = int(manifest.get("max_len", cfg.max_len))
+        if manifest_max_len > cfg.max_len:
+            raise ValueError(f"manifest max_len {manifest_max_len} exceeds --max-len {cfg.max_len}")
+        if int(manifest.get("vocab_size", cfg.vocab_size)) != cfg.vocab_size:
+            raise ValueError(f"manifest vocab_size {manifest.get('vocab_size')} != --vocab-size {cfg.vocab_size}")
 
     model = SiameseModel(cfg)
     state = create_state(model, cfg)
+    param_count = tree_param_count(state.params)
+    total_examples = manifest_example_count([Path(d) for d in cfg.data_dirs])
     rng = jax.random.PRNGKey(cfg.seed)
     train_loader = TokenizedShardLoader([Path(d) for d in cfg.data_dirs], batch_size=cfg.batch_size, seed=cfg.seed, prefetch=cfg.loader_prefetch)
     eval_loader = TokenizedShardLoader([Path(d) for d in cfg.data_dirs], batch_size=cfg.batch_size, seed=cfg.seed + 17, prefetch=cfg.loader_prefetch)
@@ -388,7 +420,17 @@ def main() -> None:
         state, rng, start_step = load_checkpoint(resolve_checkpoint_path(cfg.resume, out), state, train_loader, eval_loader)
         log(out, {"event": "resumed", "step": start_step, "checkpoint": cfg.resume})
 
-    log(out, {"event": "startup", "device": str(jax.devices()[0]), "shards": len(train_loader.shards), "args": asdict(cfg)})
+    log(
+        out,
+        {
+            "event": "startup",
+            "device": str(jax.devices()[0]),
+            "shards": len(train_loader.shards),
+            "tokenized_examples": total_examples,
+            "parameters": param_count,
+            "args": asdict(cfg),
+        },
+    )
     started = time.time()
     deadline = started + cfg.duration_minutes * 60 if cfg.duration_minutes > 0 else math.inf
     step = start_step
@@ -398,6 +440,7 @@ def main() -> None:
             break
         batch_started = time.time()
         batch = train_loader.next_batch()
+        batch_token_count = int(batch.shape[0] * batch.shape[1] * batch.shape[2])
         rng, step_rng = jax.random.split(rng)
         state, metrics = train_step(
             state,
@@ -423,7 +466,10 @@ def main() -> None:
                     "elapsed_s": round(elapsed, 2),
                     "batch_s": round(batch_s, 4),
                     "examples_per_s": round(cfg.batch_size / max(batch_s, 1e-9), 2),
-                    "tokens_per_s": round(cfg.batch_size * 3 * cfg.max_len / max(batch_s, 1e-9), 2),
+                    "seq_len": int(batch.shape[-1]),
+                    "tokens_per_s": round(batch_token_count / max(batch_s, 1e-9), 2),
+                    "est_hours_per_epoch": estimate_hours(total_examples, cfg.batch_size / max(batch_s, 1e-9)),
+                    "est_hours_target_epochs": estimate_hours(int(total_examples * cfg.target_epochs), cfg.batch_size / max(batch_s, 1e-9)),
                 }
             )
             log(out, record)
@@ -477,22 +523,22 @@ def make_loss_fn(
     sigreg_slices: int,
 ):
     def loss_fn(params: Any, state: TrainState, batch: jnp.ndarray, rng: jnp.ndarray):
-        za, zp, zn = state.apply_fn({"params": params}, batch, deterministic=True)
-        za_n = l2_normalize(za)
+        pred, za, zp, zn = state.apply_fn({"params": params}, batch, deterministic=True)
+        pred_n = l2_normalize(pred)
         zp_n = l2_normalize(zp)
         zn_n = l2_normalize(zn)
-        sim_pos = jnp.sum(za_n * zp_n, axis=-1)
-        sim_neg = jnp.sum(za_n * zn_n, axis=-1)
-        pos_loss = 1.0 - jnp.mean(sim_pos)
+        sim_pos = jnp.sum(pred_n * zp_n, axis=-1)
+        sim_neg = jnp.sum(pred_n * zn_n, axis=-1)
+        jepa_loss = jnp.mean(jnp.square(pred - zp))
         rank_loss = jnp.mean(jnp.maximum(0.0, margin + sim_neg - sim_pos))
-        logits = za_n @ zp_n.T / temperature
+        logits = pred_n @ zp_n.T / temperature
         labels = jnp.arange(batch.shape[0])
         inbatch_loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
         sigreg_loss = sliced_sigreg(jnp.concatenate([za, zp, zn], axis=0), rng, sigreg_slices)
-        loss = pos_weight * pos_loss + rank_weight * rank_loss + inbatch_weight * inbatch_loss + sigreg_weight * sigreg_loss
+        loss = pos_weight * jepa_loss + rank_weight * rank_loss + inbatch_weight * inbatch_loss + sigreg_weight * sigreg_loss
         metrics = {
             "loss": loss,
-            "pos_loss": pos_loss,
+            "jepa_loss": jepa_loss,
             "rank_loss": rank_loss,
             "inbatch_loss": inbatch_loss,
             "sigreg_loss": sigreg_loss,
@@ -505,7 +551,7 @@ def make_loss_fn(
     return loss_fn
 
 
-@partial(jax.jit, static_argnames=("sigreg_slices",))
+@partial(jax.jit, static_argnames=("sigreg_slices",), donate_argnums=(0,))
 def train_step(
     state: TrainState,
     batch: jnp.ndarray,
@@ -533,12 +579,12 @@ def train_step(
 
 @jax.jit
 def eval_step(state: TrainState, batch: jnp.ndarray) -> dict[str, jnp.ndarray]:
-    za, zp, zn = state.apply_fn({"params": state.params}, batch, deterministic=True)
-    za = l2_normalize(za)
+    pred, _za, zp, zn = state.apply_fn({"params": state.params}, batch, deterministic=True)
+    pred = l2_normalize(pred)
     zp = l2_normalize(zp)
     zn = l2_normalize(zn)
-    sim_pos = jnp.sum(za * zp, axis=-1)
-    sim_neg = jnp.sum(za * zn, axis=-1)
+    sim_pos = jnp.sum(pred * zp, axis=-1)
+    sim_neg = jnp.sum(pred * zn, axis=-1)
     return {
         "eval_rank_acc": jnp.mean(sim_pos > sim_neg),
         "eval_sim_pos": jnp.mean(sim_pos),
@@ -585,6 +631,29 @@ def load_manifest(data_dir: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     return json.loads(path.read_text())
+
+
+def manifest_example_count(data_dirs: list[Path]) -> int:
+    total = 0
+    for data_dir in data_dirs:
+        manifest = load_manifest(data_dir)
+        if manifest:
+            total += int(manifest.get("counts", {}).get("written_examples", 0))
+        else:
+            for shard in data_dir.glob("shard-*.npz"):
+                with np.load(shard) as data:
+                    total += int(data["tokens"].shape[0])
+    return total
+
+
+def tree_param_count(params: Any) -> int:
+    return int(sum(np.prod(value.shape) for value in jax.tree_util.tree_leaves(params)))
+
+
+def estimate_hours(total_examples: int, examples_per_s: float) -> float | None:
+    if total_examples <= 0 or examples_per_s <= 0:
+        return None
+    return round(total_examples / examples_per_s / 3600, 3)
 
 
 def load_tokens(path: Path) -> np.ndarray:

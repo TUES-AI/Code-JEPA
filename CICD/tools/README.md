@@ -2,22 +2,21 @@
 
 The committed image/workflow setup is intentionally simple:
 
-- build/push image from `CICD/Docker/code-jepa-training/`;
+- build/push the runtime image from `CICD/Docker/code-jepa-training/`;
 - publish DockerHub image `bonanc/code-jepa:latest`;
-- do not pull an S3 startup script in the image;
-- do not use per-job `sync_dirs.txt` lists.
+- do not bake the repo into the image;
+- do not store repo tarballs or per-job startup scripts in S3.
 
-For data on a GPU pod, sync the whole project bucket:
+On startup the image syncs the whole project bucket:
 
-```bash
-set -a; source .env; set +a
-sync-code-jepa-all
+```text
+s3://code-jepa/ -> /proj/s3/
 ```
 
 Equivalent raw command:
 
 ```bash
-s5cmd sync --size-only "s3://code-jepa/*" "/proj/code-jepa/"
+s5cmd sync --size-only "s3://code-jepa/*" "/proj/s3/"
 ```
 
-Pods are still ephemeral: push checkpoints/artifacts back to `s3://code-jepa/` before deletion.
+Pods are ephemeral: push checkpoints/artifacts back to `s3://code-jepa/` before deletion.

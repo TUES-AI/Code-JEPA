@@ -1,6 +1,6 @@
 # Code-JEPA Docker image
 
-Build context for the Code-JEPA GPU training image.
+Build context for the Code-JEPA GPU training runtime image.
 
 Canonical image:
 
@@ -28,22 +28,11 @@ Stack:
 Runtime paths:
 
 ```text
-/proj/Code-JEPA      repo workdir
-/proj/code-jepa      synced project data/artifacts
-/proj/huggingface    HF cache
-/proj/checkpoints    training checkpoints
-/proj/artifacts      run artifacts
+/proj               root home and login/work dir
+/proj/Code-JEPA     repo copied from local machine after pod startup
+/proj/s3            full s3://code-jepa/ mirror, synced on startup
+/proj/huggingface   HF cache
+/opt/venv           image Python/JAX/PyTorch env, outside the /proj volume
 ```
 
-No startup script is pulled from S3 by the image. If a pod needs data, sync the whole project bucket explicitly:
-
-```bash
-set -a; source .env; set +a
-sync-code-jepa-all
-```
-
-That syncs:
-
-```text
-s3://code-jepa/ -> /proj/code-jepa/
-```
+The repo is not baked into the image and is not pulled from S3. Copy the local working tree to `/proj/Code-JEPA` after the pod is reachable.

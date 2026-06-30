@@ -10,10 +10,4 @@ on:
     branches: [main]
     paths:
       - "CICD/Docker/code-jepa-training/**"
-      - ".dockerignore"
       - ".github/workflows/Build_images.yml"
-      - "pyproject.toml"
-      - "README.md"
-      - "src/**"
-      - "scripts/**"
-      - "tests/**"

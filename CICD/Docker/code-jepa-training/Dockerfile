@@ -1,12 +1,8 @@
 # syntax=docker/dockerfile:1.7
 
-# Image-build workflow note:
-# This image is currently rebuilt by GitHub Actions and pushed to DockerHub as
-# bonanc/code-jepa:latest. Local code commits are not visible inside pods until
-# CI rebuilds the image or the working tree is patched into /proj/Code-JEPA.
-# A local CI/build path may be useful later for faster iteration, but CUDA images
-# need substantial SSD space, so GitHub's free hosted builders are the practical
-# default for now.
+# Runtime image only. The repository is not baked into the image and is not
+# fetched from S3; copy the local working tree to /proj/Code-JEPA after a pod
+# starts.
 
 FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS s5cmd-builder
 ARG TARGETOS
@@ -26,9 +22,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     VENV_DIR=/opt/venv \
     APP_ROOT=/proj \
-    IMAGE_REPO_DIR=/opt/code-jepa-image \
+    HOME=/proj \
     REPO_DIR=/proj/Code-JEPA \
-    CODE_JEPA_DATA_ROOT=/proj/code-jepa \
+    PYTHONPATH=/proj/Code-JEPA/src \
+    CODE_JEPA_DATA_ROOT=/proj/s3 \
+    S3_BUCKET=code-jepa \
+    S3_SYNC_ON_STARTUP=true \
     HF_HOME=/proj/huggingface \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     TRANSFORMERS_CACHE=/proj/huggingface/transformers \
@@ -77,7 +76,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN "python${PYTHON_VERSION}" -m venv "$VENV_DIR" \
     && "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel uv
 
-ENV PATH="/opt/venv/bin:$PATH" VIRTUAL_ENV=/opt/venv
+ENV PATH="${VENV_DIR}/bin:$PATH" VIRTUAL_ENV="${VENV_DIR}"
+
+# Keep the image venv active in SSH shells even when /proj is a mounted volume.
+RUN printf '%s\n' \
+      "VIRTUAL_ENV=${VENV_DIR}" \
+      "PATH=${VENV_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+      >> /etc/environment \
+    && printf '%s\n' 'source /opt/venv/bin/activate || true' > /etc/profile.d/activate-venv.sh \
+    && printf '%s\n' 'set -o vi' > /etc/profile.d/vi-mode.sh \
+    && printf '%s\n' 'set -g mode-keys vi' > /etc/tmux.conf
 
 # PyTorch wheel CUDA must match the CUDA runtime family in the base image.
 RUN pip install --index-url https://download.pytorch.org/whl/cu128 \
@@ -88,27 +96,23 @@ RUN pip install --index-url https://download.pytorch.org/whl/cu128 \
 # JAX CUDA wheels use the official CUDA-12 plugin wheels.
 RUN pip install -U "jax[cuda12]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 
-COPY CICD/Docker/code-jepa-training/requirements.txt /tmp/code-jepa-requirements.txt
+COPY requirements.txt /tmp/code-jepa-requirements.txt
 RUN pip install -r /tmp/code-jepa-requirements.txt
 
 COPY --from=s5cmd-builder /go/bin/s5cmd /usr/local/bin/s5cmd
-COPY CICD/Docker/code-jepa-training/verify_gpu_stack.py /usr/local/bin/verify-gpu-stack
-COPY CICD/Docker/code-jepa-training/sync-code-jepa-all.sh /usr/local/bin/sync-code-jepa-all
-COPY CICD/Docker/code-jepa-training/entrypoint.sh /usr/local/bin/code-jepa-entrypoint
+COPY verify_gpu_stack.py /usr/local/bin/verify-gpu-stack
+COPY sync-code-jepa-all.sh /usr/local/bin/sync-code-jepa-all
+COPY entrypoint.sh /usr/local/bin/code-jepa-entrypoint
 RUN chmod +x /usr/local/bin/verify-gpu-stack /usr/local/bin/sync-code-jepa-all /usr/local/bin/code-jepa-entrypoint \
     && s5cmd version \
     && python /usr/local/bin/verify-gpu-stack
 
 RUN curl -fsSL https://tailscale.com/install.sh | sh
 
-WORKDIR $IMAGE_REPO_DIR
-COPY pyproject.toml README.md ./
-COPY src ./src
-COPY scripts ./scripts
-COPY tests ./tests
-RUN pip install -e ".[dev,transforms]"
+RUN mkdir -p "$APP_ROOT" "$CODE_JEPA_DATA_ROOT" "$HF_HOME" /var/lib/tailscale \
+    && usermod -d "$APP_ROOT" root
 
-RUN mkdir -p "$CODE_JEPA_DATA_ROOT" "$HF_HOME" /proj/checkpoints /proj/artifacts /var/lib/tailscale
+WORKDIR $APP_ROOT
 
 ENTRYPOINT ["/usr/local/bin/code-jepa-entrypoint"]
 CMD []

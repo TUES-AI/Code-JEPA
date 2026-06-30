@@ -1,6 +1,6 @@
 # code-jepa-training image
 
-GPU image for Code-JEPA data loading and model training.
+GPU runtime image for Code-JEPA data loading and model training.
 
 Image tag pushed by CI:
 
@@ -15,10 +15,10 @@ python /usr/local/bin/verify-gpu-stack
 nvidia-smi
 ```
 
-Full bucket sync helper:
+Startup behavior:
 
-```bash
-sync-code-jepa-all
+```text
+s3://code-jepa/ -> /proj/s3/
 ```
 
-No S3 startup script is fetched automatically. Start training explicitly after the pod is ready.
+The image does not contain the repo. `/opt/venv` is outside the `/proj` volume and is activated for shells. After the pod is ready, sync the local working tree to `/proj/Code-JEPA` and run from there.

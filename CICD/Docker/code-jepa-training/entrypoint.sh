@@ -4,9 +4,8 @@ set -euo pipefail
 echo "[code-jepa] entrypoint start"
 
 APP_ROOT="${APP_ROOT:-/proj}"
-DATA_DIR="${CODE_JEPA_DATA_ROOT:-${APP_ROOT}/code-jepa}"
+DATA_DIR="${CODE_JEPA_DATA_ROOT:-${APP_ROOT}/s3}"
 REPO_DIR="${REPO_DIR:-${APP_ROOT}/Code-JEPA}"
-IMAGE_REPO_DIR="${IMAGE_REPO_DIR:-/opt/code-jepa-image}"
 HF_HOME="${HF_HOME:-${APP_ROOT}/huggingface}"
 TS_STATE_DIR="${TS_STATE_DIR:-/var/lib/tailscale}"
 TS_HOSTNAME="${TS_HOSTNAME:-gpu-box}"
@@ -14,22 +13,9 @@ TS_TAGS="${TS_TAGS:-tag:gpu}"
 TS_ACCEPT_DNS="${TS_ACCEPT_DNS:-false}"
 TS_ENABLE_SSH="${TS_ENABLE_SSH:-true}"
 
-mkdir -p "$APP_ROOT" "$DATA_DIR" "$HF_HOME" /proj/checkpoints /proj/artifacts "$TS_STATE_DIR" /var/run/tailscale
-
-if [[ ! -d "$REPO_DIR/.git" ]]; then
-  echo "[code-jepa] materializing repo into ${REPO_DIR}"
-  rm -rf "$REPO_DIR"
-  mkdir -p "$(dirname "$REPO_DIR")"
-  rsync -a "$IMAGE_REPO_DIR/" "$REPO_DIR/"
-fi
-
-if ! git config --system --get-all safe.directory 2>/dev/null | grep -Fxq "$REPO_DIR"; then
-  git config --system --add safe.directory "$REPO_DIR" 2>/dev/null || true
-fi
-
-if [[ -f "$REPO_DIR/pyproject.toml" ]]; then
-  /opt/venv/bin/pip install -e "$REPO_DIR[dev,transforms]" >/tmp/code-jepa-editable-install.log 2>&1 || cat /tmp/code-jepa-editable-install.log
-fi
+export CODE_JEPA_DATA_ROOT="$DATA_DIR"
+mkdir -p "$APP_ROOT" "$DATA_DIR" "$HF_HOME" "$TS_STATE_DIR" /var/run/tailscale
+cd "$APP_ROOT"
 
 nohup /usr/sbin/tailscaled \
   --tun=userspace-networking \
@@ -63,7 +49,16 @@ done
 
 tailscale status || true
 
-echo "[code-jepa] ready repo=${REPO_DIR} data=${DATA_DIR}"
+if [[ "${S3_SYNC_ON_STARTUP:-true}" == "true" ]]; then
+  echo "[code-jepa] syncing s3://${S3_BUCKET:-code-jepa}/ -> ${DATA_DIR}/"
+  if /usr/local/bin/sync-code-jepa-all; then
+    echo "[code-jepa] s3 sync complete"
+  else
+    echo "[code-jepa] s3 sync failed; leaving pod running for inspection" >&2
+  fi
+fi
+
+echo "[code-jepa] ready workspace=${APP_ROOT} repo=${REPO_DIR} s3=${DATA_DIR}"
 
 if [[ $# -gt 0 ]]; then
   exec "$@"

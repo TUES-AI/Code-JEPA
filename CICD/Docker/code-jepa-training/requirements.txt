@@ -31,4 +31,5 @@ tokenizers
 tqdm
 transformers
 tree-sitter
+tree-sitter-language-pack
 wandb
