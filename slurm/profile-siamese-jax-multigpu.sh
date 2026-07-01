@@ -25,6 +25,7 @@ PYTHON_BIN=${PYTHON_BIN:-${JAX_ENV}/bin/python}
 
 export VIRTUAL_ENV=${JAX_ENV}
 export PATH=${VIRTUAL_ENV}/bin:${PATH}
+export TF_GPU_ALLOCATOR=${TF_GPU_ALLOCATOR:-cuda_malloc_async}
 
 cd "${PROJECT_DIR}"
 mkdir -p logs "${OUTPUT_DIR}"
@@ -43,17 +44,14 @@ PY
 
 "${PYTHON_BIN}" -m pip install -e . --no-deps -q
 
-# Best safe table from RunPod 4x RTX PRO 4000 Blackwell 24GB profiling:
-# - full H100 table OOMed at bucket-256
-# - hybrid larger long-bucket table later OOMed after several bucket shape compilations
-# - this table completed and raised 4-GPU scaling efficiency from 62.7% to 78.0%
+# Discoverer H200 path: use the high-memory preset first. If it OOMs, fall back
+# to custom bucket batches `128:256 256:256 512:64 1024:16 2048:4` from 24GB RTX profiling.
 "${PYTHON_BIN}" scripts/profile_siamese_bpe_jepa.py \
   --data-dirs "${DATA_DIR}" \
   --output-dir "${OUTPUT_DIR}" \
   --device-counts 1 2 4 \
   --model-size roberta_25m \
-  --hardware-preset custom \
-  --bucket-batches 128:256 256:256 512:64 1024:16 2048:4 \
+  --hardware-preset h200 \
   --max-len 2048 \
   --duration-minutes 5 \
   --log-every 10

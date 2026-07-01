@@ -26,6 +26,7 @@ STOP_AFTER_EPOCHS=${STOP_AFTER_EPOCHS:-1.0}
 
 export VIRTUAL_ENV=${JAX_ENV}
 export PATH=${VIRTUAL_ENV}/bin:${PATH}
+export TF_GPU_ALLOCATOR=${TF_GPU_ALLOCATOR:-cuda_malloc_async}
 
 cd "${PROJECT_DIR}"
 mkdir -p logs "${OUTPUT_DIR}"
@@ -49,8 +50,7 @@ PY
   --output-dir "${OUTPUT_DIR}" \
   --num-devices 4 \
   --model-size roberta_25m \
-  --hardware-preset custom \
-  --bucket-batches 128:256 256:256 512:64 1024:16 2048:4 \
+  --hardware-preset h200 \
   --max-len 2048 \
   --steps 1000000 \
   --target-epochs "${STOP_AFTER_EPOCHS}" \

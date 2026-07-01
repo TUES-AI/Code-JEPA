@@ -54,8 +54,9 @@ from code_jepa.training.siamese_bpe_jepa import (
 BUCKET_BATCH_PRESETS: dict[str, dict[int, int]] = {
     # Per-device examples. H100 values are intentionally close to the measured
     # fixed-256 smoke, while long buckets are conservative until profiled.
+    "h200": {128: 1024, 256: 1024, 512: 512, 1024: 128, 2048: 32},
     "h100": {128: 512, 256: 512, 512: 128, 1024: 32, 2048: 8},
-    # A40 development defaults trade utilization for not OOMing during pmap smoke.
+    # A40/24GB development defaults trade utilization for not OOMing during pmap smoke.
     "a40": {128: 256, 256: 256, 512: 64, 1024: 16, 2048: 4},
     "safe": {128: 128, 256: 128, 512: 32, 1024: 8, 2048: 2},
 }
@@ -166,7 +167,7 @@ class BucketShardLoader:
                 continue
             indices = self.example_order[self.example_pos : self.example_pos + global_batch]
             self.example_pos += global_batch
-            batch = self.tokens[indices].astype(np.int32, copy=False)
+            batch = self.tokens[indices]
             batch = batch.reshape(self.devices, per_device_batch, 3, seq_len)
             return batch, per_device_batch, seq_len
         raise ValueError("all tokenized shards are smaller than their configured global batch")
@@ -306,7 +307,7 @@ def parse_args() -> MultiGpuConfig:
     p.add_argument("--stop-after-epochs", type=float, default=0.0, help="Stop after this many epochs over the tokenized cache; 0 disables epoch-based stopping")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--num-devices", type=int, default=0, help="0 means all local devices")
-    p.add_argument("--hardware-preset", choices=["h100", "a40", "safe", "custom"], default="h100")
+    p.add_argument("--hardware-preset", choices=["h200", "h100", "a40", "safe", "custom"], default="h200")
     p.add_argument("--bucket-batches", nargs="*", default=None, help="Per-device batches, e.g. 128:512 256:512 512:128 1024:32 2048:8")
     p.add_argument("--model-size", choices=["roberta_20m", "roberta_25m", "roberta_30m", "custom"], default="roberta_25m")
     p.add_argument("--hidden-size", type=int, default=512)
@@ -386,13 +387,17 @@ def main() -> None:
             log(out, {"event": "deadline", "step": step, "examples_seen": examples_seen})
             break
         batch_started = time.time()
+        load_started = time.time()
         batch, per_device_batch, seq_len = train_loader.next_batch()
+        loader_s = time.time() - load_started
         global_batch = per_device_batch * len(devices)
         batch_token_count = int(global_batch * 3 * seq_len)
         rng, step_rng = jax.random.split(rng)
         rngs = replicate_for_pmap(step_rng, devices)
+        step_started = time.time()
         replicated_state, metrics = train_step(replicated_state, batch, rngs)
         jax.block_until_ready(metrics["loss"])
+        step_s = time.time() - step_started
         examples_seen += global_batch
         last_metrics = metrics
         batch_s = time.time() - batch_started
@@ -407,6 +412,8 @@ def main() -> None:
                     "epoch_fraction": round(examples_seen / max(total_examples, 1), 6),
                     "elapsed_s": round(elapsed, 2),
                     "batch_s": round(batch_s, 4),
+                    "loader_s": round(loader_s, 4),
+                    "step_s": round(step_s, 4),
                     "seq_len": seq_len,
                     "per_device_batch": per_device_batch,
                     "global_batch": global_batch,

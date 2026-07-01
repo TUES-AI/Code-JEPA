@@ -48,12 +48,13 @@ dropout         = 0.0
 Per-device batches in `scripts/train_siamese_bpe_jepa_multigpu.py`:
 
 ```text
-h100: 128:512 256:512 512:128 1024:32 2048:8
-a40:  128:256 256:256 512:64  1024:16 2048:4
-safe: 128:128 256:128 512:32  1024:8  2048:2
+h200: 128:1024 256:1024 512:512 1024:128 2048:32
+h100: 128:512  256:512  512:128 1024:32  2048:8
+a40:  128:256  256:256  512:64  1024:16  2048:4
+safe: 128:128  256:128  512:32  1024:8   2048:2
 ```
 
-RunPod 4x RTX PRO 4000 Blackwell 24GB result: the `a40` table is the best safe table. It improved 4-GPU scaling from `62.7%` to `78.0%`. Full `h100` table OOMed at bucket-256; hybrid larger long-bucket table later OOMed after several bucket shape compilations.
+RunPod 4x RTX PRO 4000 Blackwell 24GB result: the `a40` table is the best safe 24GB table. It improved 4-GPU scaling from `62.7%` to `78.0%`. On Discoverer H200, use `h200` first; if it OOMs or fragments, fall back to the `a40` table.
 
 ## Discoverer SLURM commands
 
