@@ -1,9 +1,13 @@
 # CLAUDE.md
 
-Read `Project.md` first: it is the scientific source of truth. Read `Work.md` next: it says what is active now and at most one step ahead.
+## Resources:
 
-Keep `Project.md` updated only when the research idea changes. Keep `Work.md` ultra-short. Code must follow `Project.md`, not silently redefine it.
+Read `Project.md` first: it is the scientific source of truth. Keep `Project.md` updated only when the research idea changes.
 
 Use repo skills from `.claude/skills/`. 
 
+## Rules:
+
 Don't commit unless told.
+
+wHEN YOU DO COMMIT INCLUDE RESULTS with specific tables, numbers from training experiemnts that were done since last commit no matter successful or failed. This helps team communication and tracking progress others are doing.

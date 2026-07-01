@@ -126,11 +126,11 @@ def main() -> None:
                 limit = remaining_global if limit is None else min(limit, remaining_global)
             segment_iter = examples_from_limited_segment(segment, triples, limit, manifest)
         else:
-            view_by_id = load_all_views(segment)
+            unit_view_shards = build_unit_view_shard_index(segment, manifest)
             segment_iter = (
                 example
                 for triples_path in triples
-                for example in examples_from_triples(segment, triples_path, view_by_id, manifest)
+                for example in examples_from_triples_with_unit_index(segment, triples_path, unit_view_shards, manifest)
             )
         for example in segment_iter:
             total_examples += 1
@@ -200,7 +200,7 @@ def normalized_bucket_lengths(cfg: Config) -> list[int]:
 
 
 def bucket_for_example(
-    example: dict[str, str],
+    example: dict[str, Any],
     tokenizer: PreTrainedTokenizerFast,
     bucket_lengths: list[int],
     manifest: dict[str, Any],
@@ -211,6 +211,7 @@ def bucket_for_example(
         truncation=False,
         return_attention_mask=False,
     )["input_ids"]
+    example["_token_ids"] = encoded
     required = max(len(ids) for ids in encoded)
     for length in bucket_lengths:
         if required <= length:
@@ -296,7 +297,25 @@ def load_all_views(segment: Path) -> dict[str, str]:
     return view_by_id
 
 
+def build_unit_view_shard_index(segment: Path, manifest: dict[str, Any]) -> dict[str, list[Path]]:
+    unit_to_paths: dict[str, list[Path]] = {}
+    entries = 0
+    for views_path in sorted((segment / "views").rglob("*.parquet")):
+        table = pq.read_table(views_path, columns=["unit_id"])
+        for unit_id in set(table.column("unit_id").to_pylist()):
+            if not unit_id:
+                continue
+            paths = unit_to_paths.setdefault(unit_id, [])
+            if not paths or paths[-1] != views_path:
+                paths.append(views_path)
+                entries += 1
+    manifest["counts"]["view_unit_index_units"] += len(unit_to_paths)
+    manifest["counts"]["view_unit_index_entries"] += entries
+    return unit_to_paths
+
+
 TRIPLE_COLUMNS = [
+    "unit_id",
     "anchor_view_id",
     "positive_view_id",
     "negative_view_id",
@@ -340,9 +359,36 @@ def examples_from_triples(
     return examples_from_records(segment, records_from_triple_table(triple_table, triples_path), view_by_id, manifest)
 
 
+def examples_from_triples_with_unit_index(
+    segment: Path,
+    triples_path: Path,
+    unit_view_shards: dict[str, list[Path]],
+    manifest: dict[str, Any],
+) -> list[dict[str, str]]:
+    triple_table = pq.read_table(triples_path, columns=TRIPLE_COLUMNS)
+    manifest["counts"]["input_triples"] += triple_table.num_rows
+    records = records_from_triple_table(triple_table, triples_path)
+    needed_view_ids: set[str] = set()
+    view_paths: set[Path] = set()
+    for record in records:
+        needed_view_ids.update([record["anchor_view_id"], record["positive_view_id"], record["negative_view_id"]])
+        paths = unit_view_shards.get(record["unit_id"], [])
+        if not paths:
+            manifest["counts"]["missing_unit_view_index"] += 1
+        view_paths.update(paths)
+    view_by_id = load_needed_views_from_paths(view_paths, needed_view_ids)
+    missing = needed_view_ids.difference(view_by_id)
+    if missing:
+        manifest["counts"]["fallback_view_scans"] += 1
+        fallback = load_needed_views(segment, missing)
+        view_by_id.update(fallback)
+    return examples_from_records(segment, records, view_by_id, manifest)
+
+
 def records_from_triple_table(table: Any, triples_path: Path) -> list[dict[str, str]]:
     return [
         {
+            "unit_id": unit_id,
             "anchor_view_id": anchor_id,
             "positive_view_id": positive_id,
             "negative_view_id": negative_id,
@@ -351,7 +397,8 @@ def records_from_triple_table(table: Any, triples_path: Path) -> list[dict[str, 
             "negative_type": negative_type or "unknown",
             "source_shard": triples_path.name,
         }
-        for anchor_id, positive_id, negative_id, positive_transform, negative_transform, negative_type in zip(
+        for unit_id, anchor_id, positive_id, negative_id, positive_transform, negative_transform, negative_type in zip(
+            table.column("unit_id").to_pylist(),
             table.column("anchor_view_id").to_pylist(),
             table.column("positive_view_id").to_pylist(),
             table.column("negative_view_id").to_pylist(),
@@ -363,10 +410,14 @@ def records_from_triple_table(table: Any, triples_path: Path) -> list[dict[str, 
 
 
 def load_needed_views(segment: Path, needed_view_ids: set[str]) -> dict[str, str]:
+    return load_needed_views_from_paths(sorted((segment / "views").rglob("*.parquet")), needed_view_ids)
+
+
+def load_needed_views_from_paths(paths: set[Path] | list[Path], needed_view_ids: set[str]) -> dict[str, str]:
     view_by_id: dict[str, str] = {}
     if not needed_view_ids:
         return view_by_id
-    for views_path in sorted((segment / "views").rglob("*.parquet")):
+    for views_path in sorted(paths):
         table = pq.read_table(views_path, columns=["view_id", "code"])
         view_ids = table.column("view_id").to_pylist()
         if not any(view_id in needed_view_ids for view_id in view_ids):
@@ -425,28 +476,35 @@ def flush_shard(
     max_len: int | None = None,
 ) -> int:
     shard_max_len = int(max_len or cfg.max_len)
-    tokens = np.empty((len(examples), 3, shard_max_len), dtype=np.uint16)
+    pad_id = int(tokenizer.pad_token_id or 0)
+    tokens = np.full((len(examples), 3, shard_max_len), pad_id, dtype=np.uint16)
     positive_transform_id = np.empty((len(examples),), dtype=np.uint16)
     negative_transform_id = np.empty((len(examples),), dtype=np.uint16)
     negative_type_id = np.empty((len(examples),), dtype=np.uint16)
 
-    for start in range(0, len(examples), cfg.tokenize_batch_size):
-        batch_examples = examples[start : start + cfg.tokenize_batch_size]
-        texts = [item["anchor"] for item in batch_examples]
-        texts += [item["positive"] for item in batch_examples]
-        texts += [item["negative"] for item in batch_examples]
-        encoded = tokenizer(
-            texts,
-            padding="max_length",
-            truncation=True,
-            max_length=shard_max_len,
-            return_attention_mask=False,
-        )["input_ids"]
-        arr = np.asarray(encoded, dtype=np.uint16)
-        n = len(batch_examples)
-        tokens[start : start + n, 0, :] = arr[:n]
-        tokens[start : start + n, 1, :] = arr[n : 2 * n]
-        tokens[start : start + n, 2, :] = arr[2 * n :]
+    if examples and "_token_ids" in examples[0]:
+        for row, example in enumerate(examples):
+            for view_index, ids in enumerate(example["_token_ids"]):
+                clipped = ids[:shard_max_len]
+                tokens[row, view_index, : len(clipped)] = np.asarray(clipped, dtype=np.uint16)
+    else:
+        for start in range(0, len(examples), cfg.tokenize_batch_size):
+            batch_examples = examples[start : start + cfg.tokenize_batch_size]
+            texts = [item["anchor"] for item in batch_examples]
+            texts += [item["positive"] for item in batch_examples]
+            texts += [item["negative"] for item in batch_examples]
+            encoded = tokenizer(
+                texts,
+                padding="max_length",
+                truncation=True,
+                max_length=shard_max_len,
+                return_attention_mask=False,
+            )["input_ids"]
+            arr = np.asarray(encoded, dtype=np.uint16)
+            n = len(batch_examples)
+            tokens[start : start + n, 0, :] = arr[:n]
+            tokens[start : start + n, 1, :] = arr[n : 2 * n]
+            tokens[start : start + n, 2, :] = arr[2 * n :]
 
     for idx, example in enumerate(examples):
         positive_transform_id[idx] = vocab_id(transform_vocab["positive"], example["positive_transform"])
