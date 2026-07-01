@@ -15,7 +15,6 @@
 set -euo pipefail
 module purge
 module load anaconda3
-module load nvidia/cuda/12
 
 PROJECT_DIR=${PROJECT_DIR:-/valhalla/projects/bg-eng-01/Code-JEPA}
 JAX_ENV=${JAX_ENV:-/valhalla/projects/bg-eng-01/conda_envs/torch}
@@ -27,6 +26,10 @@ STOP_AFTER_EPOCHS=${STOP_AFTER_EPOCHS:-1.0}
 export VIRTUAL_ENV=${JAX_ENV}
 export PATH=${VIRTUAL_ENV}/bin:${PATH}
 export TF_GPU_ALLOCATOR=${TF_GPU_ALLOCATOR:-cuda_malloc_async}
+
+# Point to pip-bundled CUDA libs so JAX doesn't pick up conflicting system CUDA
+SITE_PACKAGES=$("${PYTHON_BIN}" -c "import site; print(site.getsitepackages()[0])")
+export LD_LIBRARY_PATH="${SITE_PACKAGES}/nvidia/cusparse/lib:${SITE_PACKAGES}/nvidia/cublas/lib:${SITE_PACKAGES}/nvidia/cuda_runtime/lib:${SITE_PACKAGES}/nvidia/cudnn/lib:${SITE_PACKAGES}/nvidia/nccl/lib:${SITE_PACKAGES}/nvidia/nvjitlink/lib:${LD_LIBRARY_PATH:-}"
 
 cd "${PROJECT_DIR}"
 mkdir -p logs "${OUTPUT_DIR}"
