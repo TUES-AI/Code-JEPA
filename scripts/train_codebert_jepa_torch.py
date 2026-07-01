@@ -505,7 +505,8 @@ def train_step(
     scaler.unscale_(optimizer)
     grad_norm = float(
         torch.nn.utils.clip_grad_norm_(
-            list(ctx.parameters()) + list(predictor.parameters()), args.grad_clip
+            list(ctx.parameters()) + list(projector.parameters()) + list(predictor.parameters()),
+            args.grad_clip,
         )
         .detach()
         .cpu()
