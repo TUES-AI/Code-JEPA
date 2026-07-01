@@ -1,186 +1,270 @@
 #!/usr/bin/env python3
-"""Profile the main Siamese BPE Code-JEPA training step by segment."""
+"""Profile the no-predictor bucketed Siamese JAX trainer across device counts.
+
+This is the scaling harness for RunPod/Discoverer smoke tests. It runs the same
+trainer used for real training, parses its JSONL logs, and reports ETA plus
+multi-GPU scaling efficiency against the one-device run.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import statistics
+import subprocess
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+TRAIN_SCRIPT = ROOT / "scripts" / "train_siamese_bpe_jepa_multigpu.py"
 
-import jax
-import numpy as np
 
-from code_jepa.training.siamese_bpe_jepa import (
-    SiameseModel,
-    TokenizedShardLoader,
-    TrainConfig,
-    create_state,
-    eval_step,
-    train_step,
-)
+DEFAULT_BUCKET_BATCHES = {
+    "h100": ["128:512", "256:512", "512:128", "1024:32", "2048:8"],
+    "a40": ["128:256", "256:256", "512:64", "1024:16", "2048:4"],
+    "safe": ["128:128", "256:128", "512:32", "1024:8", "2048:2"],
+}
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data-dirs", nargs="+", required=True)
     p.add_argument("--output-dir", required=True)
-    p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--max-len", type=int, default=256)
+    p.add_argument("--device-counts", nargs="+", type=int, default=[1, 2, 4])
+    p.add_argument("--duration-minutes", type=float, default=5.0)
+    p.add_argument("--steps", type=int, default=1_000_000)
+    p.add_argument("--model-size", choices=["roberta_20m", "roberta_25m", "roberta_30m", "custom"], default="roberta_25m")
+    p.add_argument("--hardware-preset", choices=["h100", "a40", "safe", "custom"], default="a40")
+    p.add_argument("--bucket-batches", nargs="*", default=None, help="Per-device batches, e.g. 128:256 256:256 512:64 1024:16 2048:4")
+    p.add_argument("--max-len", type=int, default=2048)
     p.add_argument("--vocab-size", type=int, default=16384)
-    p.add_argument("--pad-token-id", type=int, default=0)
     p.add_argument("--hidden-size", type=int, default=512)
     p.add_argument("--projection-dim", type=int, default=512)
     p.add_argument("--layers", type=int, default=6)
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--intermediate-size", type=int, default=2048)
     p.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
-    p.add_argument("--warmup-steps", type=int, default=10)
-    p.add_argument("--profile-steps", type=int, default=50)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--warmup-steps", type=int, default=1000)
+    p.add_argument("--sigreg-weight", type=float, default=0.05)
+    p.add_argument("--inbatch-weight", type=float, default=0.1)
+    p.add_argument("--rank-weight", type=float, default=1.0)
+    p.add_argument("--pos-weight", type=float, default=1.0)
+    p.add_argument("--temperature", type=float, default=0.05)
+    p.add_argument("--margin", type=float, default=0.2)
+    p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--skip-initial-logs", type=int, default=1)
     p.add_argument("--loader-prefetch", type=int, default=1)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--forward-profile-steps", type=int, default=20)
+    p.add_argument("--python", default=sys.executable)
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    out = Path(args.output_dir).expanduser().resolve()
-    out.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    runs = []
+    for count in args.device_counts:
+        run_dir = output_dir / f"devices-{count}"
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        command = build_command(args, count, run_dir)
+        (run_dir / "profile-command.json").write_text(json.dumps(command, indent=2) + "\n")
+        print(json.dumps({"event": "profile_run_start", "devices": count, "output_dir": str(run_dir), "command": command}), flush=True)
+        with (run_dir / "profile-subprocess.log").open("w") as log:
+            proc = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+        if proc.returncode != 0:
+            raise RuntimeError(f"profile run failed for {count} devices; see {run_dir / 'profile-subprocess.log'}")
+        result = summarize_run(run_dir, count, args.skip_initial_logs)
+        runs.append(result)
+        print(json.dumps({"event": "profile_run_done", **result}, sort_keys=True), flush=True)
+    summary = scaling_summary(args, runs, started)
+    (output_dir / "scaling-summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    (output_dir / "scaling-summary.md").write_text(render_markdown(summary) + "\n")
+    print(json.dumps({"event": "scaling_summary", **summary}, sort_keys=True), flush=True)
 
-    cfg = TrainConfig(
-        data_dirs=args.data_dirs,
-        output_dir=str(out),
-        vocab_size=args.vocab_size,
-        pad_token_id=args.pad_token_id,
-        max_len=args.max_len,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        hidden_size=args.hidden_size,
-        projection_dim=args.projection_dim,
-        layers=args.layers,
-        heads=args.heads,
-        intermediate_size=args.intermediate_size,
-        precision=args.precision,
-        loader_prefetch=args.loader_prefetch,
-    )
-    (out / "profile-config.json").write_text(json.dumps(asdict(cfg), indent=2, sort_keys=True) + "\n")
 
-    t0 = time.perf_counter()
-    loader = TokenizedShardLoader([Path(d) for d in args.data_dirs], batch_size=args.batch_size, seed=args.seed, prefetch=args.loader_prefetch)
-    loader_init_s = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    state = create_state(SiameseModel(cfg), cfg)
-    jax.block_until_ready(jax.tree.leaves(state.params)[0])
-    model_init_s = time.perf_counter() - t0
-
-    rng = jax.random.PRNGKey(args.seed)
-    records: list[dict[str, float | int | str]] = []
-
-    def timed_step(step: int, phase: str):
-        nonlocal state, rng
-        t_step = time.perf_counter()
-        t0 = time.perf_counter()
-        batch = loader.next_batch()
-        if batch.shape[-1] != args.max_len:
-            batch = batch[:, :, : args.max_len]
-        loader_s = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        dev_batch = jax.device_put(batch)
-        jax.block_until_ready(dev_batch)
-        device_put_s = time.perf_counter() - t0
-
-        rng, step_rng = jax.random.split(rng)
-        t0 = time.perf_counter()
-        state, metrics = train_step(
-            state,
-            dev_batch,
-            step_rng,
-            cfg.margin,
-            cfg.pos_weight,
-            cfg.rank_weight,
-            cfg.inbatch_weight,
-            cfg.temperature,
-            cfg.sigreg_weight,
-            cfg.sigreg_slices,
+def build_command(args: argparse.Namespace, device_count: int, run_dir: Path) -> list[str]:
+    bucket_batches = args.bucket_batches
+    hardware_preset = args.hardware_preset
+    if hardware_preset != "custom" and bucket_batches is None:
+        bucket_batches = DEFAULT_BUCKET_BATCHES[hardware_preset]
+    command = [
+        args.python,
+        str(TRAIN_SCRIPT),
+        "--data-dirs",
+        *args.data_dirs,
+        "--output-dir",
+        str(run_dir),
+        "--num-devices",
+        str(device_count),
+        "--hardware-preset",
+        hardware_preset,
+        "--model-size",
+        args.model_size,
+        "--vocab-size",
+        str(args.vocab_size),
+        "--max-len",
+        str(args.max_len),
+        "--steps",
+        str(args.steps),
+        "--duration-minutes",
+        str(args.duration_minutes),
+        "--log-every",
+        str(args.log_every),
+        "--eval-every",
+        "0",
+        "--save-every",
+        "0",
+        "--s3-sync-every",
+        "0",
+        "--loader-prefetch",
+        str(args.loader_prefetch),
+        "--precision",
+        args.precision,
+        "--lr",
+        str(args.lr),
+        "--warmup-steps",
+        str(args.warmup_steps),
+        "--sigreg-weight",
+        str(args.sigreg_weight),
+        "--inbatch-weight",
+        str(args.inbatch_weight),
+        "--rank-weight",
+        str(args.rank_weight),
+        "--pos-weight",
+        str(args.pos_weight),
+        "--temperature",
+        str(args.temperature),
+        "--margin",
+        str(args.margin),
+    ]
+    if args.model_size == "custom":
+        command.extend(
+            [
+                "--hidden-size",
+                str(args.hidden_size),
+                "--projection-dim",
+                str(args.projection_dim),
+                "--layers",
+                str(args.layers),
+                "--heads",
+                str(args.heads),
+                "--intermediate-size",
+                str(args.intermediate_size),
+            ]
         )
-        jax.block_until_ready(metrics["loss"])
-        train_s = time.perf_counter() - t0
-        total_s = time.perf_counter() - t_step
-        record = {
-            "phase": phase,
-            "step": step,
-            "loader_s": loader_s,
-            "device_put_s": device_put_s,
-            "train_s": train_s,
-            "total_s": total_s,
-            "examples_per_s_total": args.batch_size / total_s,
-            "examples_per_s_train": args.batch_size / train_s,
-            "tokens_per_s_total": args.batch_size * 3 * args.max_len / total_s,
-            "loss": float(metrics["loss"]),
-            "rank_acc": float(metrics["rank_acc"]),
+    if bucket_batches:
+        command.extend(["--bucket-batches", *bucket_batches])
+    return command
+
+
+def summarize_run(run_dir: Path, device_count: int, skip_initial_logs: int) -> dict[str, Any]:
+    records = read_jsonl(run_dir / "metrics.jsonl")
+    startup = next((item for item in records if item.get("event") == "startup"), {})
+    train = [item for item in records if item.get("event") == "train"]
+    if not train:
+        raise ValueError(f"no train records in {run_dir / 'metrics.jsonl'}")
+    steady = train[skip_initial_logs:] or train
+    examples_per_s = [float(item["examples_per_s"]) for item in steady]
+    tokens_per_s = [float(item["tokens_per_s"]) for item in steady]
+    tokenized_examples = int(startup.get("tokenized_examples", train[-1].get("examples_seen", 0)))
+    median_eps = statistics.median(examples_per_s)
+    seq_lens = sorted({int(item["seq_len"]) for item in steady})
+    by_seq_len = {}
+    for seq_len in seq_lens:
+        seq_records = [item for item in steady if int(item["seq_len"]) == seq_len]
+        by_seq_len[str(seq_len)] = {
+            "logs": len(seq_records),
+            "median_examples_per_s": statistics.median(float(item["examples_per_s"]) for item in seq_records),
+            "median_tokens_per_s": statistics.median(float(item["tokens_per_s"]) for item in seq_records),
+            "median_batch_s": statistics.median(float(item["batch_s"]) for item in seq_records),
         }
-        print(json.dumps(record, sort_keys=True), flush=True)
-        records.append(record)
-
-    timed_step(1, "compile")
-    for i in range(2, args.warmup_steps + 2):
-        timed_step(i, "warmup")
-    for i in range(args.warmup_steps + 2, args.warmup_steps + args.profile_steps + 2):
-        timed_step(i, "profile")
-
-    forward_records = []
-    for i in range(args.forward_profile_steps + 1):
-        t0 = time.perf_counter()
-        batch = loader.next_batch()
-        if batch.shape[-1] != args.max_len:
-            batch = batch[:, :, : args.max_len]
-        dev_batch = jax.device_put(batch)
-        jax.block_until_ready(dev_batch)
-        put_s = time.perf_counter() - t0
-        t0 = time.perf_counter()
-        metrics = eval_step(state, dev_batch)
-        jax.block_until_ready(metrics["eval_rank_acc"])
-        forward_s = time.perf_counter() - t0
-        phase = "forward_compile" if i == 0 else "forward_profile"
-        record = {
-            "phase": phase,
-            "step": i,
-            "device_put_s": put_s,
-            "forward_s": forward_s,
-            "examples_per_s_forward": args.batch_size / forward_s,
-        }
-        print(json.dumps(record, sort_keys=True), flush=True)
-        forward_records.append(record)
-
-    profile = [r for r in records if r["phase"] == "profile"]
-    forward_profile = [r for r in forward_records if r["phase"] == "forward_profile"]
-    summary = {
-        "loader_init_s": loader_init_s,
-        "model_init_s": model_init_s,
-        "profile_steps": len(profile),
+    return {
+        "devices": device_count,
+        "output_dir": str(run_dir),
+        "logs": len(train),
+        "steady_logs": len(steady),
+        "tokenized_examples": tokenized_examples,
+        "median_examples_per_s": median_eps,
+        "mean_examples_per_s": statistics.mean(examples_per_s),
+        "median_tokens_per_s": statistics.median(tokens_per_s),
+        "mean_tokens_per_s": statistics.mean(tokens_per_s),
+        "est_hours_per_epoch": round(tokenized_examples / max(median_eps, 1e-9) / 3600, 3),
+        "observed_seq_lens": seq_lens,
+        "by_seq_len": by_seq_len,
+        "last_train": train[-1],
     }
-    for key in ["loader_s", "device_put_s", "train_s", "total_s", "examples_per_s_total", "examples_per_s_train", "tokens_per_s_total"]:
-        vals = [float(r[key]) for r in profile]
-        summary[f"mean_{key}"] = statistics.mean(vals)
-        summary[f"median_{key}"] = statistics.median(vals)
-    if forward_profile:
-        forward_vals = [float(r["forward_s"]) for r in forward_profile]
-        summary["mean_forward_s"] = statistics.mean(forward_vals)
-        summary["median_forward_s"] = statistics.median(forward_vals)
-        summary["train_to_forward_ratio"] = summary["median_train_s"] / summary["median_forward_s"]
-    (out / "profile-summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-    print(json.dumps({"event": "summary", **summary}, sort_keys=True), flush=True)
+
+
+def scaling_summary(args: argparse.Namespace, runs: list[dict[str, Any]], started: float) -> dict[str, Any]:
+    runs = sorted(runs, key=lambda item: item["devices"])
+    base = runs[0]
+    base_per_gpu_eps = float(base["median_examples_per_s"]) / int(base["devices"])
+    previous = None
+    table = []
+    for run in runs:
+        devices = int(run["devices"])
+        eps = float(run["median_examples_per_s"])
+        ideal = base_per_gpu_eps * devices
+        item = dict(run)
+        item["speedup_vs_base"] = round(eps / max(float(base["median_examples_per_s"]), 1e-9), 3)
+        item["scaling_efficiency_percent"] = round(100.0 * eps / max(ideal, 1e-9), 1)
+        if previous is None:
+            item["incremental_examples_per_s"] = 0.0
+            item["incremental_efficiency_percent"] = None
+        else:
+            added_devices = devices - int(previous["devices"])
+            delta = eps - float(previous["median_examples_per_s"])
+            item["incremental_examples_per_s"] = round(delta, 2)
+            item["incremental_efficiency_percent"] = round(100.0 * delta / max(base_per_gpu_eps * added_devices, 1e-9), 1)
+        table.append(item)
+        previous = run
+    return {
+        "format": "code-jepa-multigpu-scaling-profile-v1",
+        "created_at_unix": time.time(),
+        "elapsed_s": round(time.time() - started, 2),
+        "config": vars(args),
+        "base_devices": int(base["devices"]),
+        "base_median_examples_per_s": float(base["median_examples_per_s"]),
+        "base_per_gpu_examples_per_s": base_per_gpu_eps,
+        "runs": table,
+    }
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def render_markdown(summary: dict[str, Any]) -> str:
+    lines = [
+        "# Multi-GPU Siamese profile summary",
+        "",
+        f"Base: {summary['base_devices']} device(s), {summary['base_median_examples_per_s']:.2f} examples/s median.",
+        "",
+        "| Devices | Median ex/s | ETA h/epoch | Speedup | Scaling eff. | Incremental ex/s | Incremental eff. |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for run in summary["runs"]:
+        inc_eff = "-" if run["incremental_efficiency_percent"] is None else f"{run['incremental_efficiency_percent']:.1f}%"
+        lines.append(
+            "| {devices} | {eps:.2f} | {eta:.3f} | {speedup:.3f}x | {eff:.1f}% | {inc:.2f} | {inc_eff} |".format(
+                devices=run["devices"],
+                eps=run["median_examples_per_s"],
+                eta=run["est_hours_per_epoch"],
+                speedup=run["speedup_vs_base"],
+                eff=run["scaling_efficiency_percent"],
+                inc=run["incremental_examples_per_s"],
+                inc_eff=inc_eff,
+            )
+        )
+    lines.extend(["", "Per-bucket medians are in `scaling-summary.json` under `runs[].by_seq_len`."])
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

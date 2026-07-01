@@ -110,7 +110,7 @@ RUN chmod +x /usr/local/bin/verify-gpu-stack /usr/local/bin/sync-code-jepa-all /
 RUN curl -fsSL https://tailscale.com/install.sh | sh
 
 RUN mkdir -p "$APP_ROOT" "$CODE_JEPA_DATA_ROOT" "$HF_HOME" /var/lib/tailscale \
-    && usermod -d "$APP_ROOT" root
+    && sed -i "s#^root:\([^:]*\):0:0:\([^:]*\):[^:]*:#root:\1:0:0:\2:${APP_ROOT}:#" /etc/passwd
 
 WORKDIR $APP_ROOT
 

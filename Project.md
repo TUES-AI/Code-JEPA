@@ -34,19 +34,19 @@ The model is not a correctness oracle. It ranks, clusters, detects duplicate fai
 
 ## Model shape
 
-Use a LeJEPA-style shared-encoder setup with a predictor:
+Use a shared-encoder Siamese setup as the default paper path:
 
 ```text
 code view -> shared transformer encoder -> hidden states H
           -> mask-aware mean pool        -> h
           -> projection head p(h)        -> z
 
-anchor z_anchor -> predictor -> predicted positive z
-positive/negative views -> z_pos / z_neg
+anchor/positive/negative views -> same shared encoder/projection -> z_anchor/z_pos/z_neg
+train z_anchor close to z_pos and far from z_neg
 SIGReg(z outputs)
 ```
 
-LeJEPA training uses one shared encoder for all views: no target encoder, no EMA, and no stop-grad. Apply SIGReg in the projected training space `z`, not directly to the reusable encoder embedding `h`. Use a small SIGReg coefficient around `0.03`-`0.05`; after reading LeJEPA, `0.10` should be treated as high/likely too much, not a normal setting.
+Use one shared encoder for all views and all languages: no target encoder, no EMA, and no stop-grad. Do not use an unconditioned predictor as the default; `z_anchor -> predictor -> z_pos` is only justified as an ablation unless the predictor is conditioned on transform type, language, mask/context, or target-view metadata. Apply SIGReg in the projected training space `z`, not directly to the reusable encoder embedding `h`. Use a small SIGReg coefficient around `0.03`-`0.05`; after reading LeJEPA, `0.10` should be treated as high/likely too much, not a normal setting.
 
 The default global projection head should be:
 
