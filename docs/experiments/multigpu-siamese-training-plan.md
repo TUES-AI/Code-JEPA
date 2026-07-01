@@ -53,6 +53,21 @@ a40:  128:256 256:256 512:64  1024:16 2048:4
 safe: 128:128 256:128 512:32  1024:8  2048:2
 ```
 
+RunPod 4x RTX PRO 4000 Blackwell 24GB result: the `a40` table is the best safe table. It improved 4-GPU scaling from `62.7%` to `78.0%`. Full `h100` table OOMed at bucket-256; hybrid larger long-bucket table later OOMed after several bucket shape compilations.
+
+## Discoverer SLURM commands
+
+```bash
+sbatch slurm/profile-siamese-jax-multigpu.sh
+sbatch slurm/pretrain-siamese-jax-multigpu.sh
+```
+
+Set `DATA_DIR` if the tokenized cache is staged somewhere other than:
+
+```text
+/valhalla/projects/bg-eng-01/scratch/code-jepa/tokenized/codesearchnet/bpe16k-buckets-128-256-512-1024-2048
+```
+
 ## RunPod scaling profile command
 
 Run this first on 2-4 A40/H100 devices. It executes the real multi-GPU trainer for each device count, then writes `scaling-summary.json` and `scaling-summary.md` with ETA, speedup, scaling efficiency, and incremental efficiency for each added GPU.

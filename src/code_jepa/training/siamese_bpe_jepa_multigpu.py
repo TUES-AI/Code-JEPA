@@ -71,6 +71,7 @@ class MultiGpuConfig:
     steps: int = 1_000_000
     duration_minutes: float = 0.0
     target_epochs: float = 1.0
+    stop_after_epochs: float = 0.0
     seed: int = 0
     num_devices: int = 0
     hardware_preset: str = "h100"
@@ -302,6 +303,7 @@ def parse_args() -> MultiGpuConfig:
     p.add_argument("--steps", type=int, default=1_000_000)
     p.add_argument("--duration-minutes", type=float, default=0.0)
     p.add_argument("--target-epochs", type=float, default=1.0)
+    p.add_argument("--stop-after-epochs", type=float, default=0.0, help="Stop after this many epochs over the tokenized cache; 0 disables epoch-based stopping")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--num-devices", type=int, default=0, help="0 means all local devices")
     p.add_argument("--hardware-preset", choices=["h100", "a40", "safe", "custom"], default="h100")
@@ -350,7 +352,7 @@ def main() -> None:
     validate_manifests([Path(item) for item in cfg.data_dirs], cfg)
     model = SiameseNoPredictorModel(cfg)
     state = create_state(model, cfg)
-    replicated_state = jax.device_put_replicated(state, devices)
+    replicated_state = replicate_for_pmap(state, devices)
     param_count = tree_param_count(state.params)
     total_examples = manifest_example_count([Path(d) for d in cfg.data_dirs])
     train_loader = BucketShardLoader([Path(d) for d in cfg.data_dirs], devices=len(devices), bucket_batches=bucket_batches, seed=cfg.seed, prefetch=cfg.loader_prefetch)
@@ -388,7 +390,7 @@ def main() -> None:
         global_batch = per_device_batch * len(devices)
         batch_token_count = int(global_batch * 3 * seq_len)
         rng, step_rng = jax.random.split(rng)
-        rngs = jax.device_put_replicated(step_rng, devices)
+        rngs = replicate_for_pmap(step_rng, devices)
         replicated_state, metrics = train_step(replicated_state, batch, rngs)
         jax.block_until_ready(metrics["loss"])
         examples_seen += global_batch
@@ -410,11 +412,28 @@ def main() -> None:
                     "global_batch": global_batch,
                     "examples_per_s": round(global_batch / max(batch_s, 1e-9), 2),
                     "tokens_per_s": round(batch_token_count / max(batch_s, 1e-9), 2),
-                    "est_hours_per_epoch": estimate_hours(total_examples, global_batch / max(batch_s, 1e-9)),
-                    "est_hours_target_epochs": estimate_hours(int(total_examples * cfg.target_epochs), global_batch / max(batch_s, 1e-9)),
+                    "est_hours_per_epoch": estimate_hours(
+                        total_examples,
+                        global_batch / max(batch_s, 1e-9),
+                    ),
+                    "est_hours_target_epochs": estimate_hours(
+                        int(total_examples * cfg.target_epochs),
+                        global_batch / max(batch_s, 1e-9),
+                    ),
                 }
             )
             log(out, record)
+        if cfg.stop_after_epochs > 0 and examples_seen >= int(total_examples * cfg.stop_after_epochs):
+            log(
+                out,
+                {
+                    "event": "target_epoch_done",
+                    "step": step,
+                    "examples_seen": examples_seen,
+                    "stop_after_epochs": cfg.stop_after_epochs,
+                },
+            )
+            break
         if cfg.eval_every > 0 and step % cfg.eval_every == 0:
             log(out, {"event": "eval", "step": step, **evaluate(replicated_state, eval_step, eval_loader, cfg)})
         if cfg.save_every > 0 and step % cfg.save_every == 0:
@@ -424,7 +443,7 @@ def main() -> None:
         if cfg.dry_run_steps and step >= cfg.dry_run_steps:
             log(out, {"event": "dry_run_done", "step": step, "examples_seen": examples_seen})
             break
-    if last_metrics is not None:
+    if last_metrics is not None and cfg.save_every > 0:
         save_checkpoint(out, replicated_state, rng, train_loader, eval_loader, cfg, step, examples_seen)
     if cfg.s3_output_prefix:
         sync_s3(out, cfg.s3_output_prefix)
@@ -569,6 +588,21 @@ def metrics_to_record(metrics: dict[str, jnp.ndarray]) -> dict[str, float]:
     return {key: float(jax.device_get(value)[0]) for key, value in metrics.items()}
 
 
+def replicate_for_pmap(value: Any, devices: list[jax.Device]) -> Any:
+    mesh = jax.sharding.Mesh(np.asarray(devices), ("data",))
+
+    def put_leaf(leaf: Any) -> Any:
+        arr = np.asarray(jax.device_get(leaf))
+        stacked = np.broadcast_to(arr, (len(devices),) + arr.shape).copy()
+        sharding = jax.sharding.NamedSharding(
+            mesh,
+            jax.sharding.PartitionSpec("data", *([None] * arr.ndim)),
+        )
+        return jax.device_put(stacked, sharding)
+
+    return jax.tree_util.tree_map(put_leaf, value)
+
+
 def unreplicate(value: Any) -> Any:
     return jax.tree_util.tree_map(lambda x: jax.device_get(x[0]), value)
 
@@ -615,7 +649,7 @@ def load_checkpoint(
     state = serialization.from_bytes(target_state, payload["state"])
     train_loader.load_state_dict(payload["train_loader"])
     eval_loader.load_state_dict(payload["eval_loader"])
-    return jax.device_put_replicated(state, devices), jnp.asarray(payload["rng"]), int(payload["step"]), int(payload.get("examples_seen", 0))
+    return replicate_for_pmap(state, devices), jnp.asarray(payload["rng"]), int(payload["step"]), int(payload.get("examples_seen", 0))
 
 
 def resolve_checkpoint_path(value: str, out: Path) -> Path:

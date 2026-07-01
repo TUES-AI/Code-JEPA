@@ -17,6 +17,15 @@ export CODE_JEPA_DATA_ROOT="$DATA_DIR"
 mkdir -p "$APP_ROOT" "$DATA_DIR" "$HF_HOME" "$TS_STATE_DIR" /var/run/tailscale
 cd "$APP_ROOT"
 
+if [[ "${S3_SYNC_ON_STARTUP:-true}" == "true" ]]; then
+  echo "[code-jepa] syncing s3://${S3_BUCKET:-code-jepa}/ -> ${DATA_DIR}/"
+  if /usr/local/bin/sync-code-jepa-all; then
+    echo "[code-jepa] s3 sync complete"
+  else
+    echo "[code-jepa] s3 sync failed; continuing startup for inspection" >&2
+  fi
+fi
+
 nohup /usr/sbin/tailscaled \
   --tun=userspace-networking \
   --state="${TS_STATE_DIR}/tailscaled.state" \
@@ -48,15 +57,6 @@ for _ in {1..60}; do
 done
 
 tailscale status || true
-
-if [[ "${S3_SYNC_ON_STARTUP:-true}" == "true" ]]; then
-  echo "[code-jepa] syncing s3://${S3_BUCKET:-code-jepa}/ -> ${DATA_DIR}/"
-  if /usr/local/bin/sync-code-jepa-all; then
-    echo "[code-jepa] s3 sync complete"
-  else
-    echo "[code-jepa] s3 sync failed; leaving pod running for inspection" >&2
-  fi
-fi
 
 echo "[code-jepa] ready workspace=${APP_ROOT} repo=${REPO_DIR} s3=${DATA_DIR}"
 
