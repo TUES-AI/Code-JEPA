@@ -8,7 +8,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH -o /valhalla/projects/bg-eng-01/Code-JEPA/logs/pretrain-jax-siamese.%j.out
 #SBATCH -e /valhalla/projects/bg-eng-01/Code-JEPA/logs/pretrain-jax-siamese.%j.err
 
@@ -18,7 +18,7 @@ module load anaconda3
 module load nvidia/cuda/12
 
 PROJECT_DIR=${PROJECT_DIR:-/valhalla/projects/bg-eng-01/Code-JEPA}
-JAX_ENV=${JAX_ENV:-/valhalla/projects/bg-eng-01/conda_envs/jax}
+JAX_ENV=${JAX_ENV:-/valhalla/projects/bg-eng-01/conda_envs/torch}
 DATA_DIR=${DATA_DIR:-/valhalla/projects/bg-eng-01/scratch/code-jepa/tokenized/codesearchnet/bpe16k-buckets-128-256-512-1024-2048}
 OUTPUT_DIR=${OUTPUT_DIR:-${PROJECT_DIR}/runs/pretrain-jax-siamese-${SLURM_JOB_ID}}
 PYTHON_BIN=${PYTHON_BIN:-${JAX_ENV}/bin/python}
@@ -48,7 +48,7 @@ PY
 "${PYTHON_BIN}" scripts/train_siamese_bpe_jepa_multigpu.py \
   --data-dirs "${DATA_DIR}" \
   --output-dir "${OUTPUT_DIR}" \
-  --num-devices 4 \
+  --num-devices 2 \
   --model-size roberta_25m \
   --hardware-preset h200 \
   --max-len 2048 \
