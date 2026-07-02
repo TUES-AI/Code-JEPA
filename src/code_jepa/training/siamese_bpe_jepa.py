@@ -206,7 +206,9 @@ class SiameseEncoder(nn.Module):
     cfg: TrainConfig
 
     @nn.compact
-    def __call__(self, token_ids: jnp.ndarray, *, deterministic: bool) -> jnp.ndarray:
+    def __call__(
+        self, token_ids: jnp.ndarray, *, deterministic: bool, return_hidden: bool = False
+    ) -> jnp.ndarray | tuple[jnp.ndarray, jnp.ndarray]:
         dtype = precision_dtype(self.cfg.precision)
         mask_1d = token_ids != self.cfg.pad_token_id
         token_embed = nn.Embed(
@@ -234,12 +236,15 @@ class SiameseEncoder(nn.Module):
         x = RMSNorm(dtype=jnp.float32, name="final_norm")(x)
         weights = mask_1d.astype(jnp.float32)[..., None]
         h = jnp.sum(x * weights, axis=1) / jnp.maximum(jnp.sum(weights, axis=1), 1.0)
-        return ProjectionHead(
+        z = ProjectionHead(
             hidden_size=self.cfg.hidden_size,
             projection_dim=self.cfg.projection_dim,
             dtype=dtype,
             name="projection_head",
         )(h)
+        if return_hidden:
+            return z, h.astype(jnp.float32)
+        return z
 
 
 class SiameseModel(nn.Module):
